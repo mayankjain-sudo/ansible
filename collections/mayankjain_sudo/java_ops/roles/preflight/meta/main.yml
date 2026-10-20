@@ -1,0 +1,8 @@
+---
+galaxy_info:
+  role_name: preflight
+  author: Mayank Jain
+  description: Validate Java deployment inputs and managed-host prerequisites.
+  license: MIT
+  min_ansible_version: "2.16"
+dependencies: []

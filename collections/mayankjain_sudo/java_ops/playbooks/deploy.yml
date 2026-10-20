@@ -1,0 +1,23 @@
+---
+- name: Deploy a Java application release
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  #  become: true
+  serial: 1
+  tasks:
+    - name: Deploy Java application release
+      ansible.builtin.include_role:
+        name: mayankjain_sudo.java_ops.release
+      vars:
+        java_app_name: orders-api
+        java_app_version: "{{ app_version }}"
+        java_artifact_type: jar
+        java_artifact_url: "{{ artifact_url }}"
+        java_artifact_sha256: "{{ artifact_sha256 | default('') }}"
+        java_base_dir: /opt/apps/orders-api
+        java_run_as_user: orders-api
+        java_run_as_group: orders-api
+        java_manage_service: true
+        java_service_name: orders-api
+        java_healthcheck_url: http://127.0.0.1:8080/actuator/health

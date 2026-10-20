@@ -1,0 +1,6 @@
+---
+- name: Java Ops manage service
+  ansible.builtin.service:
+    name: "{{ java_service_name }}"
+    state: "{{ java_service_state }}"
+  when: java_manage_service | bool

@@ -1,0 +1,11 @@
+---
+java_artifact_cache_dir: "{{ java_base_dir }}/cache" # noqa: var-naming[no-role-prefix]
+java_archive_artifact_path: "{{ java_app_name }}.{{ java_artifact_type }}" # noqa: var-naming[no-role-prefix]
+java_artifact_sha256: "" # noqa: var-naming[no-role-prefix]
+java_artifact_username: "" # noqa: var-naming[no-role-prefix]
+java_artifact_password: "" # noqa: var-naming[no-role-prefix]
+java_artifact_bearer_token: "" # noqa: var-naming[no-role-prefix]
+java_artifact_timeout: 30 # noqa: var-naming[no-role-prefix]
+java_validate_certs: true # noqa: var-naming[no-role-prefix]
+java_run_as_user: root # noqa: var-naming[no-role-prefix]
+java_run_as_group: root # noqa: var-naming[no-role-prefix]

@@ -1,0 +1,205 @@
+---
+- name: Validate Java rollback prerequisites
+  ansible.builtin.include_role:
+    name: mayankjain_sudo.java_ops.preflight
+  vars:
+    java_operation: rollback
+
+- name: Inspect current Java release pointer
+  ansible.builtin.stat:
+    path: "{{ java_current_path }}"
+    follow: false
+  register: rollback_current
+
+- name: Require current Java release to point into release directory
+  ansible.builtin.assert:
+    that:
+      - rollback_current.stat.islnk | default(false)
+      - (rollback_current.stat.lnk_source | default('')).startswith(java_releases_dir ~ '/')
+      - rollback_current.stat.lnk_source ==
+        java_releases_dir ~ '/' ~ (rollback_current.stat.lnk_source | basename)
+    fail_msg: >-
+      The current path must be a symlink to an existing release under
+      {{ java_releases_dir }}.
+
+- name: Select Java rollback target version
+  ansible.builtin.set_fact:
+    java_rollback_current_version: "{{ rollback_current.stat.lnk_source | basename }}"
+  # noqa: var-naming[no-role-prefix]
+
+- name: Verify current Java release directory exists
+  ansible.builtin.stat:
+    path: "{{ java_releases_dir }}/{{ java_rollback_current_version }}"
+    follow: false
+  register: rollback_active_release
+
+- name: Require a retained current Java release for recovery
+  ansible.builtin.assert:
+    that:
+      - rollback_active_release.stat.exists
+      - rollback_active_release.stat.isdir
+    fail_msg: >-
+      The active symlink points to {{ java_rollback_current_version }}, but
+      its release directory is missing. No rollback changes were made.
+
+- name: Read recorded previous Java version when no target was specified
+  ansible.builtin.slurp:
+    src: "{{ java_base_dir }}/.java_ops_previous"
+  register: rollback_previous_version_file
+  when: java_rollback_target_version | default('') | length == 0
+  failed_when: false
+
+- name: Resolve Java rollback target
+  ansible.builtin.set_fact:
+    java_resolved_rollback_target: >-
+      {{ java_rollback_target_version
+         if java_rollback_target_version | default('') | length > 0
+         else ((rollback_previous_version_file.content | b64decode | trim)
+               if rollback_previous_version_file.content is defined else '') }}
+  # noqa: var-naming[no-role-prefix]
+
+- name: Validate Java rollback version
+  ansible.builtin.assert:
+    that:
+      - java_rollback_current_version is match('^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$')
+      - java_resolved_rollback_target is match('^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$')
+      - "'..' not in java_resolved_rollback_target"
+      - java_resolved_rollback_target != java_rollback_current_version
+    fail_msg: >-
+      No usable previous Java release is recorded, or the requested target is
+      invalid or already active. Set java_rollback_target_version explicitly.
+
+- name: Verify Java rollback target exists
+  ansible.builtin.stat:
+    path: "{{ java_releases_dir }}/{{ java_resolved_rollback_target }}"
+    follow: false
+  register: rollback_target
+
+- name: Require a retained Java release directory as target
+  ansible.builtin.assert:
+    that:
+      - rollback_target.stat.exists
+      - rollback_target.stat.isdir
+    fail_msg: "Java rollback target {{ java_resolved_rollback_target }} is not an existing release directory."
+
+- name: Activate and verify Java rollback target
+  block:
+    - name: Activate previous Java release
+      ansible.builtin.file:
+        src: "{{ java_releases_dir }}/{{ java_resolved_rollback_target }}"
+        dest: "{{ java_current_path }}"
+        state: link
+        force: true
+        owner: "{{ java_run_as_user }}"
+        group: "{{ java_run_as_group }}"
+
+    - name: Point WAR deployment path to active Java release
+      ansible.builtin.file:
+        src: "{{ java_current_path }}/{{ java_app_name }}.war"
+        dest: "{{ java_war_deploy_path }}"
+        state: link
+        force: true
+      when: java_artifact_type == 'war'
+
+    - name: Restart service for Java rollback
+      ansible.builtin.service:
+        name: "{{ java_service_name }}"
+        state: "{{ java_service_state }}"
+      when: java_manage_service | bool
+
+    - name: Verify rolled back Java application
+      ansible.builtin.include_role:
+        name: mayankjain_sudo.java_ops.healthcheck
+
+    - name: Remember the version that was active before rollback
+      ansible.builtin.copy:
+        dest: "{{ java_base_dir }}/.java_ops_previous"
+        content: "{{ java_rollback_current_version }}\n"
+        owner: "{{ java_run_as_user }}"
+        group: "{{ java_run_as_group }}"
+        mode: "0600"
+
+    - name: Record successful Java rollback
+      ansible.builtin.set_fact:
+        java_result:
+          app_name: "{{ java_app_name }}"
+          requested_version: "{{ java_resolved_rollback_target }}"
+          previous_version: "{{ java_rollback_current_version }}"
+          active_version: "{{ java_resolved_rollback_target }}"
+          deployment_status: rollback_succeeded
+          outcome: rollback_succeeded
+          rollback_status: rollback_succeeded
+          healthcheck_status: "{{ java_healthcheck_status }}"
+          recovery_required: false
+      # noqa: var-naming[no-role-prefix]
+
+  rescue:
+    - name: Preserve original Java rollback error
+      ansible.builtin.set_fact:
+        java_rollback_error: "{{ ansible_failed_result.msg | default('Rollback task failed') }}"
+      # noqa: var-naming[no-role-prefix]
+
+    - name: Restore Java release that was active before rollback
+      block:
+        - name: Restore previous Java active pointer
+          ansible.builtin.file:
+            src: "{{ java_releases_dir }}/{{ java_rollback_current_version }}"
+            dest: "{{ java_current_path }}"
+            state: link
+            force: true
+            owner: "{{ java_run_as_user }}"
+            group: "{{ java_run_as_group }}"
+
+        - name: Restore WAR deployment path after rollback failure
+          ansible.builtin.file:
+            src: "{{ java_current_path }}/{{ java_app_name }}.war"
+            dest: "{{ java_war_deploy_path }}"
+            state: link
+            force: true
+          when: java_artifact_type == 'war'
+
+        - name: Restart service after Java rollback recovery
+          ansible.builtin.service:
+            name: "{{ java_service_name }}"
+            state: "{{ java_service_state }}"
+          when: java_manage_service | bool
+
+        - name: Verify restored Java application
+          ansible.builtin.include_role:
+            name: mayankjain_sudo.java_ops.healthcheck
+
+        - name: Set Java rollback failure status after successful recovery
+          ansible.builtin.set_fact:
+            java_rollback_status: rollback_failed
+          # noqa: var-naming[no-role-prefix]
+
+      rescue:
+        - name: Set Java recovery failure status
+          ansible.builtin.set_fact:
+            java_rollback_status: recovery_failed
+            java_recovery_error: "{{ ansible_failed_result.msg | default('Recovery task failed') }}"
+          # noqa: var-naming[no-role-prefix]
+
+    - name: Set structured failed Java rollback result
+      ansible.builtin.set_fact:
+        java_result:
+          app_name: "{{ java_app_name }}"
+          requested_version: "{{ java_resolved_rollback_target }}"
+          previous_version: "{{ java_rollback_current_version }}"
+          active_version: >-
+            {{ java_rollback_current_version
+               if java_rollback_status == 'rollback_failed' else 'unknown' }}
+          deployment_status: "{{ java_rollback_status }}"
+          outcome: "{{ java_rollback_status }}"
+          rollback_status: "{{ java_rollback_status }}"
+          healthcheck_status: "{{ java_healthcheck_status | default('not_run') }}"
+          recovery_required: "{{ java_rollback_status == 'recovery_failed' }}"
+          rollback_error: "{{ java_rollback_error }}"
+          recovery_error: "{{ java_recovery_error | default('') }}"
+      # noqa: var-naming[no-role-prefix]
+
+    - name: Fail Java rollback and preserve recovery outcome
+      ansible.builtin.fail:
+        msg: >-
+          Rollback of {{ java_app_name }} to {{ java_resolved_rollback_target }}
+          failed: {{ java_rollback_error }}. Final status: {{ java_rollback_status }}.

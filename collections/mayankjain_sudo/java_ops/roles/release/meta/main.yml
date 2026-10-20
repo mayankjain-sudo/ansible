@@ -1,0 +1,8 @@
+---
+galaxy_info:
+  role_name: release
+  author: Mayank Jain
+  description: Download, deploy, verify, and recover Java application releases.
+  license: MIT
+  min_ansible_version: "2.16"
+dependencies: []

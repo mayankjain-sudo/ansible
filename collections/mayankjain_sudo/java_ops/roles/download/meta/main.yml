@@ -1,0 +1,8 @@
+---
+galaxy_info:
+  role_name: download
+  author: Mayank Jain
+  description: Download Java artifacts from an HTTP(S) repository.
+  license: MIT
+  min_ansible_version: "2.16"
+dependencies: []

@@ -1,0 +1,116 @@
+---
+- name: Validate Java deployment inputs
+  ansible.builtin.assert:
+    that:
+      - java_app_name is defined and java_app_name is string
+      - java_app_name is match('^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$')
+      - java_operation in ['deploy', 'rollback']
+      - java_artifact_type in ['jar', 'war']
+      - java_base_dir is defined and java_base_dir is string and java_base_dir is match('^/')
+      - java_operation != 'deploy' or
+        (java_app_version is defined and java_app_version is string and
+         java_app_version is match('^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$') and
+         '..' not in java_app_version)
+      - java_operation != 'deploy' or
+        (java_artifact_url is defined and java_artifact_url is string and
+         java_artifact_url is match('^https?://[^/@?#]+/.+\\.(zip|tar\\.gz)(\\?[^#]*)?$') and
+         not java_artifact_url is search('(^|/)\\.{1,2}(/|\\?|$)'))
+      - >-
+        java_operation != 'deploy' or
+        (java_archive_artifact_path is string and
+         java_archive_artifact_path | length > 0 and
+         not java_archive_artifact_path.startswith('/') and
+         not java_archive_artifact_path is search('(^|/)\\.{1,2}(/|$)') and
+         '\\' not in java_archive_artifact_path and
+         not java_archive_artifact_path.endswith('/') and
+         java_archive_artifact_path ==
+           java_archive_artifact_path | regex_replace('/+', '/'))
+      - java_operation != 'deploy' or java_artifact_sha256 | length == 0 or
+        java_artifact_sha256 is match('^[A-Fa-f0-9]{64}$')
+      - java_run_as_user is string and java_run_as_user | length > 0
+      - java_run_as_group is string and java_run_as_group | length > 0
+    fail_msg: >-
+      Supply a safe application name, absolute base directory, supported
+      artifact type, and valid deployment version and absolute HTTP(S)
+      artifact URL ending in .zip or .tar.gz.
+
+- name: Validate managed-host and optional integration settings
+  ansible.builtin.assert:
+    that:
+      - ansible_facts.system | default('') == 'Linux'
+      - not java_manage_service | bool or
+        (java_service_name is string and java_service_name | length > 0)
+      - not java_manage_service | bool or java_service_state in ['started', 'restarted', 'reloaded']
+      - not java_healthcheck_enabled | bool or
+        (java_healthcheck_url is string and java_healthcheck_url | length > 0)
+      - java_healthcheck_retries | int > 0
+      - java_healthcheck_delay | int >= 0
+      - java_healthcheck_timeout | int > 0
+      - java_expected_status | int >= 100
+      - java_expected_status | int <= 599
+      - java_artifact_type != 'war' or
+        (java_war_deploy_path is defined and java_war_deploy_path is string and
+         java_war_deploy_path is match('^/'))
+    fail_msg: >-
+      Java deployments require Linux, valid health-check limits, valid enabled
+      service settings, and an absolute WAR deployment path for WAR artifacts.
+
+- name: Set derived Java deployment paths
+  ansible.builtin.set_fact:
+    _java_base_dir: "{{ java_base_dir | regex_replace('/+$', '') }}"
+    _java_releases_dir: "{{ java_releases_dir | default(java_base_dir ~ '/releases') | regex_replace('/+$', '') }}"
+    _java_current_path: "{{ java_current_path | default(java_base_dir ~ '/current') | regex_replace('/+$', '') }}"
+    _java_artifact_cache_dir: "{{ java_artifact_cache_dir | default(java_base_dir ~ '/cache') | regex_replace('/+$', '') }}"
+  # noqa: var-naming[no-role-prefix]
+
+- name: Validate Java deployment filesystem paths
+  ansible.builtin.assert:
+    that:
+      - _java_base_dir != '/' and _java_releases_dir != '/' and _java_current_path != '/'
+      - _java_artifact_cache_dir != '/'
+      - java_base_dir == _java_base_dir
+      - (java_releases_dir | default(java_base_dir ~ '/releases')) == _java_releases_dir
+      - (java_current_path | default(java_base_dir ~ '/current')) == _java_current_path
+      - (java_artifact_cache_dir | default(java_base_dir ~ '/cache')) == _java_artifact_cache_dir
+      - _javareleases_path_is_safe
+      - _java_current_path.startswith(_java_base_dir ~ '/')
+      - _java_releases_dir.startswith(_java_base_dir ~ '/')
+      - _java_artifact_cache_dir.startswith(_java_base_dir ~ '/')
+      - not _java_current_path.startswith(_java_releases_dir ~ '/')
+      - not _java_releases_dir.startswith(_java_current_path ~ '/')
+      - not _java_artifact_cache_dir.startswith(_java_releases_dir ~ '/')
+      - not _java_releases_dir.startswith(_java_artifact_cache_dir ~ '/')
+      - not _java_current_path.startswith(_java_artifact_cache_dir ~ '/')
+      - not _java_artifact_cache_dir.startswith(_java_current_path ~ '/')
+      - not java_prune_releases | default(false) | bool or java_keep_releases | default(5) | int >= 2
+      - >-
+        java_artifact_type != 'war' or
+        (java_war_deploy_path.startswith('/') and
+         not java_war_deploy_path is search('(^|/)\\.{1,2}(/|$)') and
+         java_war_deploy_path ==
+           java_war_deploy_path | regex_replace('/+', '/') | regex_replace('/+$', '') and
+         not java_war_deploy_path.startswith(_java_base_dir ~ '/'))
+    fail_msg: >-
+      Configure normalized, non-overlapping paths beneath java_base_dir.
+      Paths must not contain parent-directory components.
+  vars:
+    _javareleases_path_is_safe: >-
+      {{ _java_releases_dir.startswith(_java_base_dir ~ '/') and
+         not _java_releases_dir is search('(^|/)\\.\\.(/|$)') and
+         not _java_current_path is search('(^|/)\\.\\.(/|$)') and
+         not _java_artifact_cache_dir is search('(^|/)\\.\\.(/|$)') }}
+
+- name: Validate target-host URL authentication settings
+  ansible.builtin.assert:
+    that:
+      - >-
+        (java_artifact_username | default('') | length == 0) ==
+        (java_artifact_password | default('') | length == 0)
+      - >-
+        (java_artifact_bearer_token | default('') | length == 0) or
+        ((java_artifact_username | default('') | length == 0) and
+         (java_artifact_password | default('') | length == 0))
+    fail_msg: >-
+      Provide both Nexus username and password, or provide a bearer token; do
+      not configure both authentication methods at once.
+  when: java_operation == 'deploy'

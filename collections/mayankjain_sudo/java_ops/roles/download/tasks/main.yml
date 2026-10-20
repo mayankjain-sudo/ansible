@@ -1,0 +1,43 @@
+---
+- name: Validate Java artifact download inputs
+  ansible.builtin.include_role:
+    name: mayankjain_sudo.java_ops.preflight
+
+- name: Derive Java artifact filename and cache destination
+  ansible.builtin.set_fact:
+    java_artifact_filename: "{{ java_app_name }}.{{ java_artifact_type }}"
+    java_downloaded_artifact: >-
+      {{ java_artifact_cache_dir }}/{{ java_app_name }}-{{ java_app_version }}.{{
+         'zip' if java_artifact_url is search('\\.zip(\\?.*)?$') else 'tar.gz' }}
+ # noqa: var-naming[no-role-prefix]
+
+- name: Create Java artifact cache
+  ansible.builtin.file:
+    path: "{{ java_artifact_cache_dir }}"
+    state: directory
+    owner: "{{ java_run_as_user }}"
+    group: "{{ java_run_as_group }}"
+    mode: "0750"
+
+- name: Download Java artifact
+  ansible.builtin.get_url:
+    url: "{{ java_artifact_url }}"
+    dest: "{{ java_downloaded_artifact }}"
+    mode: "0640"
+    owner: "{{ java_run_as_user }}"
+    group: "{{ java_run_as_group }}"
+    url_username: "{{ (java_artifact_username | default('') | length > 0) | ternary(java_artifact_username, omit) }}"
+    url_password: "{{ (java_artifact_password | default('') | length > 0) | ternary(java_artifact_password, omit) }}"
+    force_basic_auth: "{{ java_artifact_username | default('') | length > 0 }}"
+    headers: >-
+      {{ {'Authorization': 'Bearer ' ~ java_artifact_bearer_token}
+         if java_artifact_bearer_token | default('') | length > 0 else {} }}
+    checksum: >-
+      {{ 'sha256:' ~ java_artifact_sha256
+         if java_artifact_sha256 | default('') | length > 0 else omit }}
+    timeout: "{{ java_artifact_timeout }}"
+    validate_certs: "{{ java_validate_certs }}"
+  register: download_result
+  no_log: >-
+    {{ (java_artifact_username | default('') | length > 0) or
+       (java_artifact_bearer_token | default('') | length > 0) }}

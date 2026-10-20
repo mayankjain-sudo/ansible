@@ -1,0 +1,18 @@
+---
+- name: Roll back a Java application release
+  hosts: java_servers
+  become: true
+  serial: 1
+  tasks:
+    - name: Roll back Java application release
+      ansible.builtin.include_role:
+        name: mayankjain_sudo.java_ops.rollback
+      vars:
+        java_app_name: orders-api
+        java_base_dir: /opt/apps/orders-api
+        java_run_as_user: orders-api
+        java_run_as_group: orders-api
+        java_rollback_target_version: "{{ rollback_version | default('') }}"
+        java_manage_service: true
+        java_service_name: orders-api
+        java_healthcheck_url: http://127.0.0.1:8080/actuator/health

@@ -1,0 +1,8 @@
+---
+galaxy_info:
+  role_name: healthcheck
+  author: Mayank Jain
+  description: Verify Java application readiness through an HTTP(S) endpoint.
+  license: MIT
+  min_ansible_version: "2.16"
+dependencies: []

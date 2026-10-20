@@ -1,0 +1,197 @@
+---
+- name: Validate Java deployment inputs
+  ansible.builtin.include_role:
+    name: mayankjain_sudo.java_ops.preflight
+
+- name: Initialize Java deployment state
+  ansible.builtin.set_fact:
+    java_activation_occurred: false
+    java_healthcheck_status: not_run
+    java_deployment_error: ""
+    java_recovery_error: ""
+    java_rollback_status: not_required
+  # noqa: var-naming[no-role-prefix]
+
+- name: Inspect currently active Java release
+  ansible.builtin.stat:
+    path: "{{ java_current_path }}"
+    follow: false
+  register: _java_previous_pointer
+
+- name: Validate currently active Java release pointer
+  ansible.builtin.assert:
+    that:
+      - >-
+        not _java_previous_pointer.stat.exists or
+        (_java_previous_pointer.stat.islnk | default(false))
+      - >-
+        not (_java_previous_pointer.stat.islnk | default(false)) or
+        (_java_previous_pointer.stat.lnk_source | default('')).startswith(java_releases_dir ~ '/')
+      - >-
+        not (_java_previous_pointer.stat.islnk | default(false)) or
+        (_java_previous_pointer.stat.lnk_source | default('')) ==
+          java_releases_dir ~ '/' ~ (_java_previous_pointer.stat.lnk_source | default('') | basename)
+      - >-
+        not (_java_previous_pointer.stat.islnk | default(false)) or
+        ((_java_previous_pointer.stat.lnk_source | default('') | basename)
+         is match('^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$'))
+    fail_msg: >-
+      The current path must be absent or a symlink to a release directory
+      under {{ java_releases_dir }}. No deployment changes were made.
+
+- name: Record previously active Java version
+  ansible.builtin.set_fact:
+    java_previous_version: >-
+      {{ (_java_previous_pointer.stat.lnk_source | default('') | basename)
+         if (_java_previous_pointer.stat.islnk | default(false)) else '' }}
+ # noqa: var-naming[no-role-prefix]
+
+- name: Verify previously active Java release exists
+  ansible.builtin.stat:
+    path: "{{ java_releases_dir }}/{{ java_previous_version }}"
+    follow: false
+  register: _java_previous_release
+  when: java_previous_version | length > 0
+
+- name: Require a retained previous Java release
+  ansible.builtin.assert:
+    that:
+      - _java_previous_release.stat.exists
+      - _java_previous_release.stat.isdir
+    fail_msg: >-
+      The active symlink points to {{ java_previous_version }}, but its
+      release directory is missing. No deployment changes were made.
+  when: java_previous_version | length > 0
+
+- name: Download, deploy, and verify Java release
+  block:
+    - name: Download versioned Java artifact
+      ansible.builtin.include_role:
+        name: mayankjain_sudo.java_ops.download
+
+    - name: Stage and activate Java release
+      ansible.builtin.include_role:
+        name: mayankjain_sudo.java_ops.deploy
+
+    - name: Verify active Java application
+      ansible.builtin.include_role:
+        name: mayankjain_sudo.java_ops.healthcheck
+
+    - name: Record successful Java deployment
+      ansible.builtin.set_fact:
+        java_deployment_status: deployment_succeeded
+        java_rollback_status: not_required
+        java_active_version: "{{ java_app_version }}"
+      # noqa: var-naming[no-role-prefix]
+
+    - name: Remember previous Java version for a future rollback
+      ansible.builtin.copy:
+        dest: "{{ java_base_dir }}/.java_ops_previous"
+        content: "{{ java_previous_version }}\n"
+        owner: "{{ java_run_as_user }}"
+        group: "{{ java_run_as_group }}"
+        mode: "0600"
+      when:
+        - java_previous_version | length > 0
+        - java_previous_version != java_app_version
+
+  rescue:
+    - name: Preserve original Java deployment error
+      ansible.builtin.set_fact:
+        java_deployment_error: "{{ ansible_failed_result.msg | default('Deployment task failed') }}"
+        java_deployment_status: deployment_failed
+      # noqa: var-naming[no-role-prefix]
+
+    - name: Attempt Java release recovery
+      when:
+        - java_activation_occurred | bool
+        - java_auto_rollback | bool
+        - java_previous_version | length > 0
+      block:
+        - name: Restore previous Java release pointer
+          ansible.builtin.file:
+            src: "{{ java_releases_dir }}/{{ java_previous_version }}"
+            dest: "{{ java_current_path }}"
+            state: link
+            force: true
+            owner: "{{ java_run_as_user }}"
+            group: "{{ java_run_as_group }}"
+
+        - name: Restore WAR deployment path after Java recovery
+          ansible.builtin.file:
+            src: "{{ java_current_path }}/{{ java_app_name }}.war"
+            dest: "{{ java_war_deploy_path }}"
+            state: link
+            force: true
+          when: java_artifact_type == 'war'
+
+        - name: Restart service after Java recovery
+          ansible.builtin.service:
+            name: "{{ java_service_name }}"
+            state: "{{ java_service_state }}"
+          when: java_manage_service | bool
+
+        - name: Verify recovered Java application
+          ansible.builtin.include_role:
+            name: mayankjain_sudo.java_ops.healthcheck
+
+        - name: Record successful Java recovery
+          ansible.builtin.set_fact:
+            java_rollback_status: rollback_succeeded
+          # noqa: var-naming[no-role-prefix]
+
+      rescue:
+        - name: Preserve Java recovery error
+          ansible.builtin.set_fact:
+            java_rollback_status: rollback_failed
+            java_recovery_error: "{{ ansible_failed_result.msg | default('Recovery task failed') }}"
+          # noqa: var-naming[no-role-prefix]
+
+    - name: Record when Java recovery is unavailable
+      ansible.builtin.set_fact:
+        java_rollback_status: >-
+          {{ 'rollback_unavailable' if java_activation_occurred | bool
+             else 'not_required' }}
+      when: java_rollback_status == 'not_required'
+      # noqa: var-naming[no-role-prefix]
+
+    - name: Set structured failed Java deployment result
+      ansible.builtin.set_fact:
+        java_result:
+          app_name: "{{ java_app_name }}"
+          requested_version: "{{ java_app_version }}"
+          previous_version: "{{ java_previous_version }}"
+          active_version: >-
+            {{ java_previous_version if java_rollback_status == 'rollback_succeeded'
+               else (java_app_version if java_activation_occurred | bool else java_previous_version) }}
+          deployment_status: deployment_failed
+          outcome: >-
+            {{ 'deployment_failed_rollback_succeeded'
+               if java_rollback_status == 'rollback_succeeded'
+               else 'deployment_failed_' ~ java_rollback_status }}
+          rollback_status: "{{ java_rollback_status }}"
+          healthcheck_status: "{{ java_healthcheck_status }}"
+          deployment_error: "{{ java_deployment_error }}"
+          recovery_error: "{{ java_recovery_error }}"
+      # noqa: var-naming[no-role-prefix]
+
+    - name: Fail Java deployment and preserve recovery outcome
+      ansible.builtin.fail:
+        msg: >-
+          Deployment of {{ java_app_name }} version {{ java_app_version }}
+          failed: {{ java_deployment_error }}. Recovery status:
+          {{ java_rollback_status }}{% if java_recovery_error | length > 0 %};
+          recovery error: {{ java_recovery_error }}{% endif %}.
+
+- name: Set structured successful Java deployment result
+  ansible.builtin.set_fact:
+    java_result:
+      app_name: "{{ java_app_name }}"
+      requested_version: "{{ java_app_version }}"
+      previous_version: "{{ java_previous_version }}"
+      active_version: "{{ java_app_version }}"
+      deployment_status: deployment_succeeded
+      outcome: deployment_succeeded
+      rollback_status: not_required
+      healthcheck_status: "{{ java_healthcheck_status }}"
+  # noqa: var-naming[no-role-prefix]

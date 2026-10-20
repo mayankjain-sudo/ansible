@@ -1,0 +1,185 @@
+---
+- name: Derive stable Java artifact filename
+  ansible.builtin.set_fact:
+    java_artifact_filename: "{{ java_app_name }}.{{ java_artifact_type }}"
+  # noqa: var-naming[no-role-prefix]
+
+- name: Create Java release directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ java_run_as_user }}"
+    group: "{{ java_run_as_group }}"
+    mode: "0750"
+  loop:
+    - "{{ java_base_dir }}"
+    - "{{ java_releases_dir }}"
+
+- name: Inspect active Java release pointer
+  ansible.builtin.stat:
+    path: "{{ java_current_path }}"
+    follow: false
+  register: deploy_current
+
+- name: Set target Java release state
+  ansible.builtin.set_fact:
+    java_final_release_path: "{{ java_releases_dir }}/{{ java_app_version }}"
+    java_previous_release_path: "{{ deploy_current.stat.lnk_source | default('') }}"
+    java_stage_required: >-
+      {{ deploy_current.stat.lnk_source | default('') !=
+         java_releases_dir ~ '/' ~ java_app_version }}
+ # noqa: var-naming[no-role-prefix]
+
+- name: Inspect existing Java release directory
+  ansible.builtin.stat:
+    path: "{{ java_final_release_path }}"
+    follow: false
+  register: _java_final_release
+
+- name: Refuse to overwrite an existing inactive Java release
+  ansible.builtin.assert:
+    that:
+      - not _java_final_release.stat.exists or not java_stage_required
+      - not _java_final_release.stat.exists or _java_final_release.stat.isdir
+    fail_msg: >-
+      Release {{ java_app_version }} already exists but is not active, or is
+      not a directory. Java releases are immutable; use a new version.
+
+- name: Inspect downloaded Java archive before extraction
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_facts.python.executable | default('/usr/bin/python3') }}"
+      - "{{ role_path }}/files/inspect_archive.py"
+      - "{{ java_downloaded_artifact }}"
+      - "{{ 'zip' if java_artifact_url is search('\\.zip(\\?.*)?$') else 'tar.gz' }}"
+  register: deploy_archive_inspection
+  changed_when: false
+  failed_when: false
+
+- name: Reject unsafe or malformed Java archives
+  ansible.builtin.assert:
+    that:
+      - deploy_archive_inspection.rc == 0
+      - deploy_archive_inspection.stdout | int > 0
+    fail_msg: >-
+      Java archive safety inspection failed:
+      {{ deploy_archive_inspection.stderr | default('invalid archive') }}
+
+- name: Create unique Java release staging directory
+  ansible.builtin.tempfile:
+    state: directory
+    path: "{{ java_releases_dir }}"
+    prefix: ".{{ java_app_version }}.staging."
+  register: deploy_staging
+  when: java_stage_required
+
+- name: Stage Java artifact and publish release
+  when: java_stage_required
+  block:
+    - name: Extract Java archive into staging
+      ansible.builtin.unarchive:
+        src: "{{ java_downloaded_artifact }}"
+        dest: "{{ deploy_staging.path }}"
+        remote_src: true
+        owner: "{{ java_run_as_user }}"
+        group: "{{ java_run_as_group }}"
+        mode: "u=rwX,g=rX,o=rX"
+
+    - name: Inspect configured deployable inside extracted archive
+      ansible.builtin.stat:
+        path: "{{ deploy_staging.path }}/{{ java_archive_artifact_path }}"
+        follow: false
+      register: deploy_payload_artifact
+
+    - name: Require the configured deployable to be a regular file
+      ansible.builtin.assert:
+        that:
+          - deploy_payload_artifact.stat.exists
+          - deploy_payload_artifact.stat.isreg
+          - not deploy_payload_artifact.stat.islnk
+        fail_msg: >-
+          The configured {{ java_artifact_type }} path
+          {{ java_archive_artifact_path }} is missing or is not a regular file
+          in the downloaded archive.
+
+    - name: Create stable application artifact name for nested payload
+      ansible.builtin.file:
+        src: "{{ java_archive_artifact_path }}"
+        dest: "{{ deploy_staging.path }}/{{ java_artifact_filename }}"
+        state: link
+        force: false
+      when: java_archive_artifact_path != java_artifact_filename
+
+    - name: Publish completed Java release directory
+      ansible.builtin.command:
+        argv:
+          - mv
+          - --
+          - "{{ deploy_staging.path }}"
+          - "{{ java_final_release_path }}"
+      changed_when: true
+
+  rescue:
+    - name: Remove incomplete Java staging directory
+      ansible.builtin.file:
+        path: "{{ deploy_staging.path }}"
+        state: absent
+
+    - name: Report Java staging failure
+      ansible.builtin.fail:
+        msg: >-
+          Staging Java release {{ java_app_version }} failed before activation:
+          {{ ansible_failed_result.msg | default('staging error') }}
+
+- name: Activate Java release
+  ansible.builtin.file:
+    src: "{{ java_final_release_path }}"
+    dest: "{{ java_current_path }}"
+    state: link
+    force: true
+    owner: "{{ java_run_as_user }}"
+    group: "{{ java_run_as_group }}"
+  register: deploy_activation
+  notify: Java Ops manage service
+
+- name: Record Java activation state
+  ansible.builtin.set_fact:
+    java_activation_occurred: "{{ deploy_activation.changed | bool }}"
+    java_active_version: "{{ java_app_version }}"
+  # noqa: var-naming[no-role-prefix]
+
+- name: Configure WAR deployment symlink
+  ansible.builtin.file:
+    src: "{{ java_current_path }}/{{ java_artifact_filename }}"
+    dest: "{{ java_war_deploy_path }}"
+    state: link
+    force: true
+  when: java_artifact_type == 'war'
+  notify: Java Ops manage service
+
+- name: Apply Java service action after activation
+  ansible.builtin.meta: flush_handlers
+
+- name: Prune old Java releases when explicitly enabled
+  when: java_prune_releases | bool
+  block:
+    - name: Find Java release directories
+      ansible.builtin.find:
+        paths: "{{ java_releases_dir }}"
+        file_type: directory
+        hidden: true
+        recurse: false
+      register: deploy_release_directories
+
+    - name: Remove oldest inactive Java releases
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: >-
+        {{ (deploy_release_directories.files
+            | rejectattr('path', 'equalto', java_final_release_path)
+            | rejectattr('path', 'equalto', java_previous_release_path)
+            | sort(attribute='mtime', reverse=true)
+            | list)[java_keep_releases | int -
+              (2 if java_previous_release_path | length > 0 else 1):] }}
+      when: java_keep_releases | int > 0
