@@ -1,0 +1,50 @@
+---
+- name: Reset archive rejection result
+  ansible.builtin.set_fact:
+    _archive_safety_rejected: false
+
+- name: Attempt deployment of the unsafe or malformed archive
+  block:
+    - name: Run deployment and expect pre-activation rejection
+      ansible.builtin.include_role:
+        name: mayankjain_sudo.release_ops.release
+      vars:
+        release_app_name: archive-safety-test
+        release_version: "{{ item.version }}"
+        release_base_dir: "{{ _archive_test_root.path }}/application"
+        release_artifact_path: "{{ _archive_test_root.path }}/fixtures/{{ item.archive }}"
+        release_manage_service: false
+        release_healthcheck_enabled: false
+        release_run_as_user: "{{ ansible_facts.user_id }}"
+        release_run_as_group: "{{ lookup('pipe', 'id -gn') }}"
+
+  rescue:
+    - name: Record expected archive rejection
+      ansible.builtin.set_fact:
+        _archive_safety_rejected: true
+
+- name: Verify archive rejection occurred before activation
+  ansible.builtin.assert:
+    that:
+      - _archive_safety_rejected
+      - release_result.deployment_error is search('Archive safety inspection failed')
+
+- name: Inspect active symlink after rejected archive
+  ansible.builtin.stat:
+    path: "{{ _archive_test_root.path }}/application/current"
+    follow: false
+  register: _archive_safety_current
+
+- name: Inspect whether a rejected release was published
+  ansible.builtin.stat:
+    path: "{{ _archive_test_root.path }}/application/releases/{{ item.version }}"
+  register: _archive_safety_rejected_release
+
+- name: Verify active release remains unchanged
+  ansible.builtin.assert:
+    that:
+      - _archive_safety_current.stat.islnk
+      - >-
+        _archive_safety_current.stat.lnk_source ==
+        _archive_test_root.path ~ '/application/releases/1.0.0'
+      - not _archive_safety_rejected_release.stat.exists

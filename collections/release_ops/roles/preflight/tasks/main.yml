@@ -1,0 +1,145 @@
+---
+- name: Validate required release inputs
+  ansible.builtin.assert:
+    that:
+      - >-
+        release_app_name is defined and release_app_name is string and
+        (release_app_name | length > 0) and
+        (release_app_name is match('^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$'))
+      - release_preflight_operation in ['deploy', 'rollback']
+      - >-
+        release_preflight_operation != 'deploy' or
+        release_version is defined and release_version is string and
+        (release_version is match('^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$')) and
+        ('..' not in release_version)
+      - >-
+        release_base_dir is defined and release_base_dir is string and
+        (release_base_dir is match('^/'))
+      - >-
+        release_preflight_operation != 'deploy' or
+        release_artifact_path is defined and release_artifact_path is string and
+        (release_artifact_path is match('^/'))
+    fail_msg: >-
+      Provide a safe release_app_name and absolute release_base_dir. Deploy
+      operations also require a safe release_version and absolute
+      target-host release_artifact_path.
+
+- name: Validate the target and optional service configuration
+  ansible.builtin.assert:
+    that:
+      - ansible_facts.system | default('') == 'Linux'
+      - release_preflight_operation != 'deploy' or release_artifact_format in ['auto', 'tar.gz', 'zip']
+      - >-
+        not release_manage_service or
+        (release_service_name is defined and release_service_name is string and
+         release_service_name | length > 0)
+      - not release_manage_service or release_service_state in ['started', 'restarted', 'reloaded']
+      - >-
+        not release_healthcheck_enabled or
+        (release_healthcheck_url is defined and release_healthcheck_url is string and
+         release_healthcheck_url | length > 0)
+      - (release_releases_dir | default(release_base_dir ~ '/releases')) is match('^/')
+      - (release_current_path | default(release_base_dir ~ '/current')) is match('^/')
+      - (release_shared_dir | default(release_base_dir ~ '/shared')) is match('^/')
+      - release_run_as_user is string and release_run_as_user | length > 0
+      - release_run_as_group is string and release_run_as_group | length > 0
+      - release_healthcheck_retries | int > 0
+      - release_healthcheck_delay | int >= 0
+      - release_healthcheck_timeout | int > 0
+      - release_expected_status | int >= 100
+      - release_expected_status | int <= 599
+    fail_msg: >-
+      The collection requires Linux facts, a supported archive format, valid
+      enabled service/health-check settings, and positive health-check limits.
+
+- name: Normalize configured application paths
+  ansible.builtin.set_fact:
+    preflight_base_dir: "{{ release_base_dir | regex_replace('/+', '/') | regex_replace('/+$', '') }}"
+    preflight_releases_dir: >-
+      {{ release_releases_dir | default(release_base_dir ~ '/releases') | regex_replace('/+', '/') | regex_replace('/+$', '') }}
+    preflight_current_path: >-
+      {{ release_current_path | default(release_base_dir ~ '/current') | regex_replace('/+', '/') | regex_replace('/+$', '') }}
+    preflight_shared_dir: >-
+      {{ release_shared_dir | default(release_base_dir ~ '/shared') | regex_replace('/+', '/') | regex_replace('/+$', '') }}
+
+- name: Validate application filesystem path relationships
+  ansible.builtin.assert:
+    that:
+      - >-
+        preflight_base_dir != '/' and
+        preflight_releases_dir != '/' and
+        preflight_current_path != '/' and
+        preflight_shared_dir != '/'
+      - >-
+        [release_base_dir,
+         release_releases_dir | default(release_base_dir ~ '/releases'),
+         release_current_path | default(release_base_dir ~ '/current'),
+         release_shared_dir | default(release_base_dir ~ '/shared')]
+        | reject('search', '(^|/)\.{1,2}(/|$)')
+        | list | length == 4
+      - release_base_dir == preflight_base_dir
+      - (release_releases_dir | default(release_base_dir ~ '/releases')) == preflight_releases_dir
+      - (release_current_path | default(release_base_dir ~ '/current')) == preflight_current_path
+      - (release_shared_dir | default(release_base_dir ~ '/shared')) == preflight_shared_dir
+      - >-
+        preflight_releases_dir.startswith(preflight_base_dir ~ '/') and
+        preflight_current_path.startswith(preflight_base_dir ~ '/') and
+        preflight_shared_dir.startswith(preflight_base_dir ~ '/')
+      - >-
+        not preflight_releases_dir.startswith(preflight_current_path ~ '/') and
+        not preflight_current_path.startswith(preflight_releases_dir ~ '/')
+      - >-
+        not preflight_releases_dir.startswith(preflight_shared_dir ~ '/') and
+        not preflight_shared_dir.startswith(preflight_releases_dir ~ '/')
+      - >-
+        not preflight_current_path.startswith(preflight_shared_dir ~ '/') and
+        not preflight_shared_dir.startswith(preflight_current_path ~ '/')
+    fail_msg: >-
+      release_base_dir must be a non-root absolute parent of the releases,
+      current, and shared paths. Those paths must not overlap, and configured
+      paths must not contain . or .. components.
+
+- name: Resolve the archive format
+  ansible.builtin.set_fact:
+    preflight_archive_format: >-
+      {{ release_artifact_format if release_artifact_format != 'auto'
+         else ('tar.gz' if release_artifact_path.endswith('.tar.gz') else
+         ('zip' if release_artifact_path.endswith('.zip') else 'unsupported')) }}
+  when: release_preflight_operation == 'deploy'
+
+- name: Reject unsupported automatic archive formats
+  ansible.builtin.assert:
+    that:
+      - preflight_archive_format in ['tar.gz', 'zip']
+      - preflight_archive_format != 'tar.gz' or release_artifact_path.endswith('.tar.gz')
+      - preflight_archive_format != 'zip' or release_artifact_path.endswith('.zip')
+    fail_msg: >-
+      Cannot infer an archive format from {{ release_artifact_path }}.
+      Use a .tar.gz or .zip file, or set release_artifact_format explicitly.
+  when: release_preflight_operation == 'deploy'
+
+- name: Inspect the target-host artifact
+  ansible.builtin.stat:
+    path: "{{ release_artifact_path }}"
+    checksum_algorithm: sha256
+  register: preflight_artifact_stat
+  when: release_preflight_operation == 'deploy'
+
+- name: Verify that the artifact is a readable regular file
+  ansible.builtin.assert:
+    that:
+      - preflight_artifact_stat.stat.exists
+      - preflight_artifact_stat.stat.isreg
+      - preflight_artifact_stat.stat.readable | default(false)
+    fail_msg: "Release artifact {{ release_artifact_path }} must exist and be readable on the target host."
+  when: release_preflight_operation == 'deploy'
+
+- name: Validate an optional SHA-256 checksum
+  ansible.builtin.assert:
+    that:
+      - release_artifact_sha256 is match('^[A-Fa-f0-9]{64}$')
+      - preflight_artifact_stat.stat.checksum | lower == release_artifact_sha256 | lower
+    fail_msg: "The release artifact SHA-256 checksum is invalid or does not match."
+  when:
+    - release_preflight_operation == 'deploy'
+    - release_artifact_sha256 | default('') | length > 0

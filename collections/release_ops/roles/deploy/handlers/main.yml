@@ -1,0 +1,6 @@
+---
+- name: Release Ops manage service
+  ansible.builtin.service:
+    name: "{{ release_service_name }}"
+    state: "{{ release_service_state }}"
+  when: release_manage_service | bool

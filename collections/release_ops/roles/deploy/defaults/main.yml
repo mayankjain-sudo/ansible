@@ -1,0 +1,4 @@
+---
+release_artifact_format: auto # noqa: var-naming[no-role-prefix]
+release_run_as_user: root # noqa: var-naming[no-role-prefix]
+release_run_as_group: root # noqa: var-naming[no-role-prefix]

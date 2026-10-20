@@ -1,0 +1,36 @@
+---
+- name: Report that health verification was skipped
+  ansible.builtin.set_fact:
+    release_healthcheck_status: healthcheck_skipped
+  # noqa: var-naming[no-role-prefix]
+  when: not release_healthcheck_enabled | bool
+
+- name: Verify the application health endpoint
+  when: release_healthcheck_enabled | bool
+  block:
+    - name: Request the application health endpoint
+      ansible.builtin.uri:
+        url: "{{ release_healthcheck_url }}"
+        method: GET
+        status_code: "{{ release_expected_status }}"
+        timeout: "{{ release_healthcheck_timeout }}"
+        return_content: false
+        validate_certs: true
+      register: healthcheck_response
+      until: healthcheck_response.status | default(0) | int == release_expected_status | int
+      retries: "{{ release_healthcheck_retries }}"
+      delay: "{{ release_healthcheck_delay }}"
+      no_log: true
+
+    - name: Record successful health verification
+      ansible.builtin.set_fact:
+        release_healthcheck_status: healthy
+      # noqa: var-naming[no-role-prefix]
+
+  rescue:
+    - name: Report health verification failure without response content
+      ansible.builtin.fail:
+        msg: >-
+          Health check failed for {{ release_app_name }} after
+          {{ release_healthcheck_retries }} attempts. Verify the service,
+          endpoint, and expected status {{ release_expected_status }}.

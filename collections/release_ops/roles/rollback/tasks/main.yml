@@ -1,0 +1,225 @@
+---
+- name: Validate shared rollback prerequisites
+  ansible.builtin.include_role:
+    name: mayankjain_sudo.release_ops.preflight
+  vars:
+    release_preflight_operation: rollback
+
+- name: Inspect the active pointer
+  ansible.builtin.stat:
+    path: "{{ release_current_path | default(release_base_dir ~ '/current') }}"
+    follow: false
+  register: _rollback_current_stat
+
+- name: Inspect the rollback filesystem roots
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+  loop:
+    - "{{ release_base_dir }}"
+    - "{{ release_releases_dir | default(release_base_dir ~ '/releases') }}"
+  register: _rollback_root_stats
+
+- name: Require real application and releases directories
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.isdir
+      - not item.stat.islnk
+    fail_msg: >-
+      Rollback requires {{ item.item }} to exist as a directory and not a
+      symbolic link. No rollback changes were made.
+  loop: "{{ _rollback_root_stats.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Read the remembered previous version
+  ansible.builtin.slurp:
+    src: "{{ release_base_dir }}/.release_ops_previous"
+  register: _rollback_previous_file
+  failed_when: false
+
+- name: Select the requested rollback version
+  ansible.builtin.set_fact:
+    _rollback_target_version: >-
+      {{ release_rollback_target_version
+         if release_rollback_target_version | default('') | length > 0
+         else ((_rollback_previous_file.content | b64decode | trim)
+               if _rollback_previous_file.content is defined else '') }}
+    _rollback_current_version: "{{ _rollback_current_stat.stat.lnk_source | default('') | basename }}"
+  # noqa: var-naming[no-role-prefix]
+
+- name: Validate the current active release before rollback
+  ansible.builtin.assert:
+    that:
+      - _rollback_current_stat.stat.islnk | default(false)
+      - >-
+        (_rollback_current_stat.stat.lnk_source | default('')).startswith(
+          (release_releases_dir | default(release_base_dir ~ '/releases')) ~ '/')
+      - _rollback_current_version is match('^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$')
+      - "'..' not in _rollback_current_version"
+      - >-
+        _rollback_current_stat.stat.lnk_source ==
+        (release_releases_dir | default(release_base_dir ~ '/releases')) ~ '/' ~ _rollback_current_version
+    fail_msg: >-
+      The active path must be a symlink to an existing release directly under
+      {{ release_releases_dir | default(release_base_dir ~ '/releases') }}.
+      No rollback changes were made.
+
+- name: Verify that the current active release can be restored
+  ansible.builtin.stat:
+    path: "{{ release_releases_dir | default(release_base_dir ~ '/releases') }}/{{ _rollback_current_version }}"
+    follow: false
+  register: _rollback_current_release_stat
+
+- name: Require a retained current release for recovery
+  ansible.builtin.assert:
+    that:
+      - _rollback_current_release_stat.stat.exists
+      - _rollback_current_release_stat.stat.isdir
+    fail_msg: >-
+      The active symlink points to {{ _rollback_current_version }}, but that
+      release directory is missing. No rollback changes were made.
+
+- name: Validate the selected rollback version
+  ansible.builtin.assert:
+    that:
+      - _rollback_target_version is match('^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$')
+      - "'..' not in _rollback_target_version"
+      - _rollback_target_version != _rollback_current_version
+    fail_msg: >-
+      No usable previous release is recorded, or the requested rollback target
+      is invalid or already active. Set release_rollback_target_version explicitly.
+
+- name: Verify that the rollback target exists
+  ansible.builtin.stat:
+    path: "{{ release_releases_dir | default(release_base_dir ~ '/releases') }}/{{ _rollback_target_version }}"
+    follow: false
+  register: _rollback_target_stat
+
+- name: Require an existing release directory as the rollback target
+  ansible.builtin.assert:
+    that:
+      - _rollback_target_stat.stat.exists
+      - _rollback_target_stat.stat.isdir
+    fail_msg: "Rollback target {{ _rollback_target_version }} does not exist as a release directory."
+
+- name: Activate and verify the rollback target
+  block:
+    - name: Activate the rollback target
+      ansible.builtin.file:
+        src: "{{ release_releases_dir | default(release_base_dir ~ '/releases') }}/{{ _rollback_target_version }}"
+        dest: "{{ release_current_path | default(release_base_dir ~ '/current') }}"
+        state: link
+        force: true
+      register: _rollback_activation
+
+    - name: Restart or reload the service after rollback
+      ansible.builtin.service:
+        name: "{{ release_service_name }}"
+        state: "{{ release_service_state }}"
+      when:
+        - _rollback_activation.changed
+        - release_manage_service | bool
+
+    - name: Verify the rollback target
+      ansible.builtin.include_role:
+        name: mayankjain_sudo.release_ops.healthcheck
+
+    - name: Remember the release that was active before rollback
+      ansible.builtin.copy:
+        dest: "{{ release_base_dir }}/.release_ops_previous"
+        content: "{{ _rollback_current_version }}\n"
+        owner: "{{ release_run_as_user }}"
+        group: "{{ release_run_as_group }}"
+        mode: "0600"
+
+    - name: Set successful rollback result
+      ansible.builtin.set_fact:
+        release_result:
+          app_name: "{{ release_app_name }}"
+          requested_version: "{{ _rollback_target_version }}"
+          previous_version: "{{ _rollback_current_version }}"
+          active_version: "{{ _rollback_target_version }}"
+          deployment_status: rollback_succeeded
+          outcome: rollback_succeeded
+          rollback_status: rollback_succeeded
+          healthcheck_status: "{{ release_healthcheck_status }}"
+          recovery_required: false
+      # noqa: var-naming[no-role-prefix]
+
+  rescue:
+    - name: Preserve the original rollback error
+      ansible.builtin.set_fact:
+        release_rollback_error: "{{ ansible_failed_result.msg | default('Rollback task failed') }}"
+      # noqa: var-naming[no-role-prefix]
+
+    - name: Attempt to restore the previously active release
+      block:
+        - name: Restore the previous release pointer
+          ansible.builtin.file:
+            src: "{{ release_releases_dir | default(release_base_dir ~ '/releases') }}/{{ _rollback_current_version }}"
+            dest: "{{ release_current_path | default(release_base_dir ~ '/current') }}"
+            state: link
+            force: true
+
+        - name: Restart or reload the service after recovery
+          ansible.builtin.service:
+            name: "{{ release_service_name }}"
+            state: "{{ release_service_state }}"
+          when: release_manage_service | bool
+
+        - name: Verify the recovered release
+          ansible.builtin.include_role:
+            name: mayankjain_sudo.release_ops.healthcheck
+
+        - name: Record a failed rollback with successful recovery
+          ansible.builtin.set_fact:
+            release_rollback_status: rollback_failed
+            release_healthcheck_status: >-
+              {{ 'healthcheck_skipped' if not release_healthcheck_enabled | bool
+                 else 'healthy' }}
+ # noqa: var-naming[no-role-prefix]
+
+      rescue:
+        - name: Preserve the recovery error
+          ansible.builtin.set_fact:
+            release_rollback_status: recovery_failed
+            release_recovery_error: "{{ ansible_failed_result.msg | default('Recovery task failed') }}"
+            release_healthcheck_status: recovery_failed
+          # noqa: var-naming[no-role-prefix]
+
+    - name: Inspect the final active pointer after recovery
+      ansible.builtin.stat:
+        path: "{{ release_current_path | default(release_base_dir ~ '/current') }}"
+        follow: false
+      register: _rollback_final_stat
+
+    - name: Set failed rollback result
+      ansible.builtin.set_fact:
+        release_result:
+          app_name: "{{ release_app_name }}"
+          requested_version: "{{ _rollback_target_version }}"
+          previous_version: "{{ _rollback_current_version }}"
+          active_version: >-
+            {{ (_rollback_final_stat.stat.lnk_source | default('') | basename)
+               if (_rollback_final_stat.stat.islnk | default(false) and
+                   (_rollback_final_stat.stat.lnk_source | default('')).startswith(
+                     (release_releases_dir | default(release_base_dir ~ '/releases')) ~ '/'))
+               else 'unknown' }}
+          deployment_status: "{{ release_rollback_status }}"
+          outcome: "{{ release_rollback_status }}"
+          rollback_status: "{{ release_rollback_status }}"
+          healthcheck_status: "{{ release_healthcheck_status | default('not_run') }}"
+          recovery_required: "{{ release_rollback_status == 'recovery_failed' }}"
+          rollback_error: "{{ release_rollback_error }}"
+          recovery_error: "{{ release_recovery_error | default('') }}"
+      # noqa: var-naming[no-role-prefix]
+
+    - name: Fail while preserving rollback and recovery errors
+      ansible.builtin.fail:
+        msg: >-
+          Rollback of {{ release_app_name }} to {{ _rollback_target_version }}
+          failed: {{ release_rollback_error }} Final status:
+          {{ release_rollback_status }}{% if release_recovery_error is defined %};
+          recovery error: {{ release_recovery_error }}{% endif %}.

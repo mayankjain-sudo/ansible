@@ -1,0 +1,8 @@
+---
+galaxy_info:
+  role_name: release
+  author: Mayank Jain
+  description: Orchestrate staged deployment, health verification, and recovery.
+  license: MIT
+  min_ansible_version: "2.18"
+dependencies: []

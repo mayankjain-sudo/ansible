@@ -1,0 +1,183 @@
+---
+- name: Validate deployment inputs and target prerequisites
+  ansible.builtin.include_role:
+    name: mayankjain_sudo.release_ops.preflight
+
+- name: Initialize deployment result state
+  ansible.builtin.set_fact:
+    release_activation_occurred: false
+    release_recovery_pointer_restored: false
+    release_healthcheck_status: not_run
+    release_deployment_error: ""
+    release_recovery_error: ""
+    release_rollback_status: not_required
+
+- name: Inspect the currently active release
+  ansible.builtin.stat:
+    path: "{{ release_current_path }}"
+    follow: false
+  register: _release_previous_pointer
+
+- name: Validate the existing active pointer
+  ansible.builtin.assert:
+    that:
+      - >-
+        not _release_previous_pointer.stat.exists or
+        (_release_previous_pointer.stat.islnk | default(false))
+      - >-
+        not (_release_previous_pointer.stat.islnk | default(false)) or
+        (_release_previous_pointer.stat.lnk_source | default('')).startswith(release_releases_dir ~ '/')
+      - >-
+        not (_release_previous_pointer.stat.islnk | default(false)) or
+        ((_release_previous_pointer.stat.lnk_source | default('') | basename)
+         is match('^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$'))
+    fail_msg: >-
+      The active path must be absent or a symlink to a version directory under
+      {{ release_releases_dir }}. No deployment changes were made.
+
+- name: Record the previous active version
+  ansible.builtin.set_fact:
+    release_previous_version: >-
+      {{ (_release_previous_pointer.stat.lnk_source | default('') | basename)
+         if (_release_previous_pointer.stat.islnk | default(false)) else '' }}
+
+- name: Verify the previous release directory is retained
+  ansible.builtin.stat:
+    path: "{{ release_releases_dir }}/{{ release_previous_version }}"
+  register: _release_previous_directory
+  when: release_previous_version | length > 0
+
+- name: Refuse deployment if the active pointer has no retained release
+  ansible.builtin.assert:
+    that:
+      - _release_previous_directory.stat.exists
+      - _release_previous_directory.stat.isdir
+    fail_msg: >-
+      The active symlink points to {{ release_previous_version }}, but that
+      release directory is missing. No deployment changes were made.
+  when: release_previous_version | length > 0
+
+- name: Deploy and verify the requested release
+  block:
+    - name: Stage and activate release
+      ansible.builtin.include_role:
+        name: mayankjain_sudo.release_ops.deploy
+
+    - name: Verify the newly active release
+      ansible.builtin.include_role:
+        name: mayankjain_sudo.release_ops.healthcheck
+
+    - name: Record successful deployment
+      ansible.builtin.set_fact:
+        release_deployment_status: deployment_succeeded
+        release_rollback_status: not_required
+        release_active_version: "{{ release_version }}"
+
+    - name: Remember the release to use for a future previous-version rollback
+      ansible.builtin.copy:
+        dest: "{{ release_base_dir }}/.release_ops_previous"
+        content: "{{ release_previous_version }}\n"
+        owner: "{{ release_run_as_user }}"
+        group: "{{ release_run_as_group }}"
+        mode: "0600"
+      when:
+        - release_previous_version | length > 0
+        - release_previous_version != release_version
+
+  rescue:
+    - name: Preserve the original deployment error
+      ansible.builtin.set_fact:
+        release_deployment_error: "{{ ansible_failed_result.msg | default('Deployment task failed') }}"
+        release_deployment_status: deployment_failed
+
+    - name: Attempt recovery when activation changed and a previous release exists
+      when:
+        - release_activation_occurred | bool
+        - release_auto_rollback | bool
+        - release_previous_version | length > 0
+      block:
+        - name: Restore the previous release pointer
+          ansible.builtin.file:
+            src: "{{ release_releases_dir }}/{{ release_previous_version }}"
+            dest: "{{ release_current_path }}"
+            state: link
+            force: true
+
+        - name: Record that the previous pointer was restored
+          ansible.builtin.set_fact:
+            release_recovery_pointer_restored: true
+
+        - name: Restart or reload the service after recovery
+          ansible.builtin.service:
+            name: "{{ release_service_name }}"
+            state: "{{ release_service_state }}"
+          when: release_manage_service | bool
+
+        - name: Verify the recovered previous release
+          ansible.builtin.include_role:
+            name: mayankjain_sudo.release_ops.healthcheck
+
+        - name: Record successful recovery
+          ansible.builtin.set_fact:
+            release_rollback_status: rollback_succeeded
+            release_healthcheck_status: >-
+              {{ 'previous_release_healthy'
+                 if release_healthcheck_enabled | bool
+                 else 'healthcheck_skipped' }}
+
+      rescue:
+        - name: Record failed recovery without replacing deployment error
+          ansible.builtin.set_fact:
+            release_rollback_status: rollback_failed
+            release_recovery_error: "{{ ansible_failed_result.msg | default('Recovery task failed') }}"
+            release_healthcheck_status: recovery_failed
+
+    - name: Record when recovery was unavailable or unnecessary
+      ansible.builtin.set_fact:
+        release_rollback_status: >-
+          {{ 'rollback_unavailable' if release_activation_occurred | bool
+             else 'not_required' }}
+      when: release_rollback_status == 'not_required'
+
+    - name: Set structured failed deployment result
+      ansible.builtin.set_fact:
+        release_result:
+          app_name: "{{ release_app_name }}"
+          requested_version: "{{ release_version }}"
+          previous_version: "{{ release_previous_version }}"
+          active_version: >-
+            {{ release_previous_version if release_recovery_pointer_restored | bool
+               else (release_version if release_activation_occurred | bool else release_previous_version) }}
+          deployment_status: deployment_failed
+          outcome: >-
+            {{ 'deployment_failed_rollback_succeeded'
+               if release_rollback_status == 'rollback_succeeded'
+               else ('deployment_failed_rollback_failed'
+                     if release_rollback_status == 'rollback_failed'
+                     else 'deployment_failed_' ~ release_rollback_status) }}
+          rollback_status: "{{ release_rollback_status }}"
+          healthcheck_status: "{{ release_healthcheck_status }}"
+          recovery_required: "{{ release_rollback_status == 'rollback_failed' }}"
+          deployment_error: "{{ release_deployment_error }}"
+          recovery_error: "{{ release_recovery_error | default('') }}"
+
+    - name: Fail the deployment while preserving recovery outcome
+      ansible.builtin.fail:
+        msg: >-
+          Deployment of {{ release_app_name }} version {{ release_version }}
+          failed: {{ release_deployment_error }}. Recovery status:
+          {{ release_rollback_status }}{% if release_recovery_error is defined %};
+          recovery error: {{ release_recovery_error }}{% endif %}.
+
+- name: Set structured successful deployment result
+  ansible.builtin.set_fact:
+    release_result:
+      app_name: "{{ release_app_name }}"
+      requested_version: "{{ release_version }}"
+      previous_version: "{{ release_previous_version }}"
+      active_version: "{{ release_version }}"
+      deployment_status: deployment_succeeded
+      outcome: deployment_succeeded
+      rollback_status: not_required
+      healthcheck_status: "{{ release_healthcheck_status }}"
+      recovery_required: false

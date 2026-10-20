@@ -1,0 +1,20 @@
+---
+release_releases_dir: "{{ release_base_dir }}/releases"
+release_current_path: "{{ release_base_dir }}/current"
+release_shared_dir: "{{ release_base_dir }}/shared"
+release_keep_releases: 5
+release_auto_rollback: true
+release_rollback_target_version: ""
+release_artifact_format: auto
+release_artifact_sha256: ""
+release_run_as_user: root
+release_run_as_group: root
+release_manage_service: false
+release_service_name: ""
+release_service_state: restarted
+release_healthcheck_enabled: true
+release_healthcheck_url: ""
+release_expected_status: 200
+release_healthcheck_retries: 10
+release_healthcheck_delay: 3
+release_healthcheck_timeout: 5

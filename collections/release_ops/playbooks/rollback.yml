@@ -1,0 +1,14 @@
+---
+- name: Roll back application release
+  hosts: application_servers
+  become: true
+  serial: 1
+  vars:
+    release_app_name: your-app
+    release_base_dir: /opt/apps/your-app
+    release_rollback_target_version: "1.4.1"
+    release_manage_service: true
+    release_service_name: your-app
+    release_healthcheck_url: http://127.0.0.1:8080/health
+  roles:
+    - role: rollback

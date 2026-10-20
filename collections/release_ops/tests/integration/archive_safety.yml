@@ -1,0 +1,86 @@
+---
+- name: Reject unsafe and malformed release archives before activation
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars:
+    _archive_safety_cases:
+      - { archive: tar-traversal.tar.gz, version: unsafe-tar-traversal }
+      - { archive: tar-symlink.tar.gz, version: unsafe-tar-symlink }
+      - { archive: tar-hardlink.tar.gz, version: unsafe-tar-hardlink }
+      - { archive: tar-malformed.tar.gz, version: malformed-tar }
+      - { archive: zip-traversal.zip, version: unsafe-zip-traversal }
+      - { archive: zip-symlink.zip, version: unsafe-zip-symlink }
+      - { archive: zip-malformed.zip, version: malformed-zip }
+  tasks:
+    - name: Create isolated archive safety test workspace
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: release-ops-archive-safety
+      register: _archive_test_root
+
+    - name: Set up archive fixtures and a known active release
+      block:
+        - name: Create fixture and active release directories
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: directory
+            mode: "0755"
+          loop:
+            - "{{ _archive_test_root.path }}/fixtures"
+            - "{{ _archive_test_root.path }}/application/releases/1.0.0"
+
+        - name: Create unsafe and malformed archive fixtures
+          ansible.builtin.command:
+            argv:
+              - python3
+              - "{{ playbook_dir }}/archive_fixtures.py"
+              - "{{ _archive_test_root.path }}/fixtures"
+          changed_when: true
+
+        - name: Set a known active release before testing
+          ansible.builtin.file:
+            src: "{{ _archive_test_root.path }}/application/releases/1.0.0"
+            dest: "{{ _archive_test_root.path }}/application/current"
+            state: link
+
+        - name: Attempt each unsafe and malformed archive
+          ansible.builtin.include_tasks: archive_safety_case.yml
+          loop: "{{ _archive_safety_cases }}"
+          loop_control:
+            label: "{{ item.archive }}"
+
+        - name: Deploy a valid archive after rejection scenarios
+          ansible.builtin.include_role:
+            name: mayankjain_sudo.release_ops.release
+          vars:
+            release_app_name: archive-safety-test
+            release_version: "2.0.0"
+            release_base_dir: "{{ _archive_test_root.path }}/application"
+            release_artifact_path: "{{ _archive_test_root.path }}/fixtures/tar-safe.tar.gz"
+            release_manage_service: false
+            release_healthcheck_enabled: false
+            release_run_as_user: "{{ ansible_facts.user_id }}"
+            release_run_as_group: "{{ lookup('pipe', 'id -gn') }}"
+
+        - name: Verify valid archive deployment succeeded
+          ansible.builtin.assert:
+            that:
+              - release_result.deployment_status == 'deployment_succeeded'
+              - release_result.active_version == '2.0.0'
+
+        - name: Verify the extracted safe archive content
+          ansible.builtin.slurp:
+            src: "{{ _archive_test_root.path }}/application/current/safe.txt"
+          register: _archive_safety_extracted_file
+
+        - name: Confirm safe archive content was extracted
+          ansible.builtin.assert:
+            that:
+              - _archive_safety_extracted_file.content | b64decode == 'safe fixture'
+
+      always:
+        - name: Remove isolated archive safety workspace
+          ansible.builtin.file:
+            path: "{{ _archive_test_root.path }}"
+            state: absent

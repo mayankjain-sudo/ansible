@@ -1,0 +1,7 @@
+---
+release_healthcheck_enabled: true # noqa: var-naming[no-role-prefix]
+release_healthcheck_url: "" # noqa: var-naming[no-role-prefix]
+release_expected_status: 200 # noqa: var-naming[no-role-prefix]
+release_healthcheck_retries: 10 # noqa: var-naming[no-role-prefix]
+release_healthcheck_delay: 3 # noqa: var-naming[no-role-prefix]
+release_healthcheck_timeout: 5 # noqa: var-naming[no-role-prefix]

@@ -1,0 +1,286 @@
+---
+- name: Test deployment validation, staging, rollback, and first-deploy failures
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars:
+    _deploy_failure_cases:
+      - name: invalid-version
+        artifact: valid.tar.gz
+        version: "invalid version"
+        expected_error: "Provide a safe release_app_name"
+      - name: missing-artifact
+        artifact: missing.tar.gz
+        version: "2.0.0"
+        expected_error: "must exist and be readable"
+      - name: checksum-mismatch
+        artifact: valid.tar.gz
+        version: "2.1.0"
+        checksum: "0000000000000000000000000000000000000000000000000000000000000000"
+        expected_error: "checksum is invalid or does not match"
+      - name: malformed-archive
+        artifact: malformed.tar.gz
+        version: "2.2.0"
+        expected_error: "Staging release 2.2.0 failed before activation"
+  tasks:
+    - name: Create isolated deployment failure workspace
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: release-ops-deploy-failures
+      register: _failure_test_root
+
+    - name: Exercise deterministic deployment failure scenarios
+      block:
+        - name: Create fixture directories and the retained current release
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: directory
+            mode: "0755"
+          loop:
+            - "{{ _failure_test_root.path }}/fixtures"
+            - "{{ _failure_test_root.path }}/payload"
+            - "{{ _failure_test_root.path }}/application/releases/0.9.0"
+            - "{{ _failure_test_root.path }}/application/releases/1.0.0"
+            - "{{ _failure_test_root.path }}/first-deploy/releases"
+
+        - name: Seed current release fixture content
+          ansible.builtin.copy:
+            dest: "{{ _failure_test_root.path }}/application/releases/1.0.0/version.txt"
+            content: "1.0.0\n"
+            mode: "0644"
+
+        - name: Set current release pointer before failure tests
+          ansible.builtin.file:
+            src: "{{ _failure_test_root.path }}/application/releases/1.0.0"
+            dest: "{{ _failure_test_root.path }}/application/current"
+            state: link
+
+        - name: Create valid release payload
+          ansible.builtin.copy:
+            dest: "{{ _failure_test_root.path }}/payload/version.txt"
+            content: "test release\n"
+            mode: "0644"
+
+        - name: Package valid release fixture
+          ansible.builtin.command:
+            argv:
+              - tar
+              - --create
+              - --gzip
+              - --file
+              - "{{ _failure_test_root.path }}/fixtures/valid.tar.gz"
+              - --directory
+              - "{{ _failure_test_root.path }}/payload"
+              - .
+          changed_when: true
+
+        - name: Create malformed tar fixture
+          ansible.builtin.copy:
+            dest: "{{ _failure_test_root.path }}/fixtures/malformed.tar.gz"
+            content: "this is not a tar archive\n"
+            mode: "0644"
+
+        - name: Attempt invalid-input and staging cases
+          ansible.builtin.include_tasks: deploy_failure_case.yml
+          loop: "{{ _deploy_failure_cases }}"
+          loop_control:
+            label: "{{ item.name }}"
+
+        - name: Select an available local test port
+          ansible.builtin.command:
+            argv:
+              - python3
+              - -c
+              - import socket; sock = socket.socket(); sock.bind(('127.0.0.1', 0)); print(sock.getsockname()[1]); sock.close()
+          register: _failure_test_port
+          changed_when: false
+
+        - name: Create health endpoint policy file
+          ansible.builtin.copy:
+            dest: "{{ _failure_test_root.path }}/unhealthy-versions.txt"
+            content: ""
+            mode: "0644"
+
+        - name: Start deterministic application health endpoint
+          ansible.builtin.command:
+            argv:
+              - python3
+              - "{{ playbook_dir }}/health_server.py"
+              - "{{ _failure_test_root.path }}/application/current"
+              - "{{ _failure_test_port.stdout }}"
+              - "{{ _failure_test_root.path }}/unhealthy-versions.txt"
+          async: 3600
+          poll: 0
+          register: _failure_test_server
+
+        - name: Wait for the test health endpoint
+          ansible.builtin.wait_for:
+            host: 127.0.0.1
+            port: "{{ _failure_test_port.stdout }}"
+            state: started
+            timeout: 10
+
+        - name: Make only new release unhealthy to test successful auto-recovery
+          ansible.builtin.copy:
+            dest: "{{ _failure_test_root.path }}/unhealthy-versions.txt"
+            content: "2.3.0"
+            mode: "0644"
+
+        - name: Attempt deployment that should recover the prior healthy release
+          block:
+            - name: Deploy unhealthy release with automatic recovery enabled
+              ansible.builtin.include_role:
+                name: mayankjain_sudo.release_ops.release
+              vars:
+                release_app_name: failure-scenarios-test
+                release_version: "2.3.0"
+                release_base_dir: "{{ _failure_test_root.path }}/application"
+                release_artifact_path: "{{ _failure_test_root.path }}/fixtures/valid.tar.gz"
+                release_run_as_user: "{{ ansible_facts.user_id }}"
+                release_run_as_group: "{{ lookup('pipe', 'id -gn') }}"
+                release_manage_service: false
+                release_healthcheck_enabled: true
+                release_healthcheck_url: "http://127.0.0.1:{{ _failure_test_port.stdout }}/health"
+                release_healthcheck_retries: 1
+                release_healthcheck_delay: 0
+                release_auto_rollback: true
+
+          rescue:
+            - name: Record expected health failure after activation
+              ansible.builtin.set_fact:
+                _successful_recovery_caught: true
+
+        - name: Verify failed deployment recovered the healthy prior version
+          ansible.builtin.assert:
+            that:
+              - _successful_recovery_caught | default(false)
+              - release_result.deployment_status == 'deployment_failed'
+              - release_result.outcome == 'deployment_failed_rollback_succeeded'
+              - release_result.rollback_status == 'rollback_succeeded'
+              - release_result.active_version == '1.0.0'
+              - release_result.deployment_error | length > 0
+              - release_result.recovery_error == ''
+
+        - name: Make prior and next release unhealthy to test failed recovery
+          ansible.builtin.copy:
+            dest: "{{ _failure_test_root.path }}/unhealthy-versions.txt"
+            content: "1.0.0,2.4.0"
+            mode: "0644"
+
+        - name: Attempt deployment whose recovery health check will fail
+          block:
+            - name: Deploy release when old and new versions are unhealthy
+              ansible.builtin.include_role:
+                name: mayankjain_sudo.release_ops.release
+              vars:
+                release_app_name: failure-scenarios-test
+                release_version: "2.4.0"
+                release_base_dir: "{{ _failure_test_root.path }}/application"
+                release_artifact_path: "{{ _failure_test_root.path }}/fixtures/valid.tar.gz"
+                release_run_as_user: "{{ ansible_facts.user_id }}"
+                release_run_as_group: "{{ lookup('pipe', 'id -gn') }}"
+                release_manage_service: false
+                release_healthcheck_enabled: true
+                release_healthcheck_url: "http://127.0.0.1:{{ _failure_test_port.stdout }}/health"
+                release_healthcheck_retries: 1
+                release_healthcheck_delay: 0
+                release_auto_rollback: true
+
+          rescue:
+            - name: Record expected failed recovery
+              ansible.builtin.set_fact:
+                _failed_recovery_caught: true
+
+        - name: Verify failed recovery reports both errors and actual active state
+          ansible.builtin.assert:
+            that:
+              - _failed_recovery_caught | default(false)
+              - release_result.deployment_status == 'deployment_failed'
+              - release_result.outcome == 'deployment_failed_rollback_failed'
+              - release_result.rollback_status == 'rollback_failed'
+              - release_result.active_version == '1.0.0'
+              - release_result.recovery_required
+              - release_result.deployment_error | length > 0
+              - release_result.recovery_error | length > 0
+
+        - name: Allow the previous release to pass health checks
+          ansible.builtin.copy:
+            dest: "{{ _failure_test_root.path }}/unhealthy-versions.txt"
+            content: "*"
+            mode: "0644"
+
+        - name: Attempt first deployment with no prior release and unhealthy target
+          block:
+            - name: Deploy first version with automatic recovery enabled
+              ansible.builtin.include_role:
+                name: mayankjain_sudo.release_ops.release
+              vars:
+                release_app_name: first-deploy-failure-test
+                release_version: "3.0.0"
+                release_base_dir: "{{ _failure_test_root.path }}/first-deploy"
+                release_artifact_path: "{{ _failure_test_root.path }}/fixtures/valid.tar.gz"
+                release_run_as_user: "{{ ansible_facts.user_id }}"
+                release_run_as_group: "{{ lookup('pipe', 'id -gn') }}"
+                release_manage_service: false
+                release_healthcheck_enabled: true
+                release_healthcheck_url: "http://127.0.0.1:{{ _failure_test_port.stdout }}/health"
+                release_healthcheck_retries: 1
+                release_healthcheck_delay: 0
+                release_auto_rollback: true
+
+          rescue:
+            - name: Record expected first-deployment failure
+              ansible.builtin.set_fact:
+                _first_deployment_failure_caught: true
+
+        - name: Verify first deployment failure reports no prior recovery
+          ansible.builtin.assert:
+            that:
+              - _first_deployment_failure_caught | default(false)
+              - release_result.outcome == 'deployment_failed_rollback_unavailable'
+              - release_result.rollback_status == 'rollback_unavailable'
+              - release_result.previous_version == ''
+              - release_result.active_version == '3.0.0'
+              - release_result.recovery_error == ''
+
+        - name: Allow explicit rollback target to pass health checks
+          ansible.builtin.copy:
+            dest: "{{ _failure_test_root.path }}/unhealthy-versions.txt"
+            content: ""
+            mode: "0644"
+
+        - name: Attempt explicit rollback to a healthy retained release
+          ansible.builtin.include_role:
+            name: mayankjain_sudo.release_ops.rollback
+          vars:
+            release_app_name: failure-scenarios-test
+            release_base_dir: "{{ _failure_test_root.path }}/application"
+            release_rollback_target_version: "0.9.0"
+            release_run_as_user: "{{ ansible_facts.user_id }}"
+            release_run_as_group: "{{ lookup('pipe', 'id -gn') }}"
+            release_manage_service: false
+            release_healthcheck_enabled: true
+            release_healthcheck_url: "http://127.0.0.1:{{ _failure_test_port.stdout }}/health"
+            release_healthcheck_retries: 1
+            release_healthcheck_delay: 0
+
+        - name: Confirm explicit rollback succeeded
+          ansible.builtin.assert:
+            that:
+              - release_result.rollback_status == 'rollback_succeeded'
+              - release_result.active_version == '0.9.0'
+              - release_result.healthcheck_status == 'healthy'
+
+      always:
+        - name: Stop test health endpoint
+          ansible.builtin.uri:
+            url: "http://127.0.0.1:{{ _failure_test_port.stdout }}/shutdown"
+            status_code: 200
+            timeout: 2
+          when: _failure_test_server is defined
+          failed_when: false
+
+        - name: Remove isolated deployment failure workspace
+          ansible.builtin.file:
+            path: "{{ _failure_test_root.path }}"
+            state: absent

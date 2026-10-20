@@ -1,0 +1,16 @@
+---
+namespace: mayankjain_sudo
+name: release_ops
+version: 1.0.0
+readme: README.md
+authors:
+  - Mayank Jain
+description: Reusable roles for versioned application deployment, health checks, and rollback.
+license:
+  - MIT
+tags:
+  - linux
+  - tools
+dependencies: {}
+repository: https://github.com/mayankjain-sudo/ansible.git
+build_ignore: []

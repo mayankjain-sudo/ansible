@@ -1,0 +1,119 @@
+---
+- name: Smoke test release deployment and idempotent activation
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars:
+    release_app_name: release-ops-smoke
+    release_version: "0.1.0"
+    release_run_as_user: "{{ ansible_facts.user_id }}"
+    release_run_as_group: "{{ lookup('pipe', 'id -gn') }}"
+    release_manage_service: false
+    release_healthcheck_enabled: false
+    release_auto_rollback: true
+  tasks:
+    - name: Create isolated smoke-test workspace
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: release-ops-test
+      register: _release_test_root
+
+    - name: Exercise deployment idempotence and immutable contents
+      block:
+        - name: Create fixture payload directory
+          ansible.builtin.file:
+            path: "{{ _release_test_root.path }}/payload"
+            state: directory
+            mode: "0755"
+
+        - name: Write initial fixture application file
+          ansible.builtin.copy:
+            dest: "{{ _release_test_root.path }}/payload/version.txt"
+            content: "original content\n"
+            mode: "0644"
+
+        - name: Create a gzip tar archive from the initial fixture
+          ansible.builtin.command:
+            argv:
+              - tar
+              - --create
+              - --gzip
+              - --file
+              - "{{ _release_test_root.path }}/application.tar.gz"
+              - --directory
+              - "{{ _release_test_root.path }}/payload"
+              - .
+          changed_when: true
+
+        - name: Set fixture archive permissions
+          ansible.builtin.file:
+            path: "{{ _release_test_root.path }}/application.tar.gz"
+            mode: "0644"
+
+        - name: Deploy the fixture release
+          ansible.builtin.include_role:
+            name: mayankjain_sudo.release_ops.release
+          vars:
+            release_base_dir: "{{ _release_test_root.path }}/application"
+            release_artifact_path: "{{ _release_test_root.path }}/application.tar.gz"
+
+        - name: Confirm successful deployment result
+          ansible.builtin.assert:
+            that:
+              - release_result.deployment_status == 'deployment_succeeded'
+              - release_result.active_version == release_version
+              - release_result.healthcheck_status == 'healthcheck_skipped'
+
+        - name: Change archive contents without changing the deployed version
+          ansible.builtin.copy:
+            dest: "{{ _release_test_root.path }}/payload/version.txt"
+            content: "modified content\n"
+            mode: "0644"
+
+        - name: Rebuild the fixture archive with changed content
+          ansible.builtin.command:
+            argv:
+              - tar
+              - --create
+              - --gzip
+              - --file
+              - "{{ _release_test_root.path }}/application.tar.gz"
+              - --directory
+              - "{{ _release_test_root.path }}/payload"
+              - .
+          changed_when: true
+
+        - name: Re-run the same active version
+          ansible.builtin.include_role:
+            name: mayankjain_sudo.release_ops.release
+          vars:
+            release_base_dir: "{{ _release_test_root.path }}/application"
+            release_artifact_path: "{{ _release_test_root.path }}/application.tar.gz"
+
+        - name: Verify active release pointer
+          ansible.builtin.stat:
+            path: "{{ _release_test_root.path }}/application/current"
+            follow: false
+          register: _release_test_current
+
+        - name: Confirm active pointer and immutable release contents
+          ansible.builtin.assert:
+            that:
+              - _release_test_current.stat.islnk
+              - _release_test_current.stat.lnk_source == _release_test_root.path ~ '/application/releases/' ~ release_version
+
+        - name: Read the published release content
+          ansible.builtin.slurp:
+            src: "{{ _release_test_root.path }}/application/current/version.txt"
+          register: _release_test_content
+
+        - name: Confirm same-version deployment did not overwrite release contents
+          ansible.builtin.assert:
+            that:
+              - _release_test_content.content | b64decode == 'original content\n'
+
+      always:
+        - name: Remove isolated smoke-test workspace
+          ansible.builtin.file:
+            path: "{{ _release_test_root.path }}"
+            state: absent

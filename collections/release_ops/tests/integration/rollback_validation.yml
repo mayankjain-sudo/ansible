@@ -1,0 +1,70 @@
+---
+- name: Verify rollback rejects invalid inputs and state before mutation
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars:
+    _rollback_validation_cases:
+      - name: missing-health-endpoint
+        current_path: "{{ _rollback_validation_root.path }}/application/current"
+        active_target: "{{ _rollback_validation_root.path }}/application/releases/1.4.2"
+        releases_path: "{{ _rollback_validation_root.path }}/application/releases"
+        shared_path: "{{ _rollback_validation_root.path }}/application/shared"
+        target_version: "1.4.1"
+        healthcheck_enabled: true
+        expected_error: "enabled service/health-check settings"
+      - name: invalid-current-symlink
+        current_path: "{{ _rollback_validation_root.path }}/application/current"
+        active_target: "{{ _rollback_validation_root.path }}/outside-release"
+        releases_path: "{{ _rollback_validation_root.path }}/application/releases"
+        shared_path: "{{ _rollback_validation_root.path }}/application/shared"
+        target_version: "1.4.1"
+        healthcheck_enabled: false
+        expected_error: "active path must be a symlink"
+      - name: missing-rollback-target
+        current_path: "{{ _rollback_validation_root.path }}/application/current"
+        active_target: "{{ _rollback_validation_root.path }}/application/releases/1.4.2"
+        releases_path: "{{ _rollback_validation_root.path }}/application/releases"
+        shared_path: "{{ _rollback_validation_root.path }}/application/shared"
+        target_version: "9.9.9"
+        healthcheck_enabled: false
+        expected_error: "does not exist as a release directory"
+      - name: overlapping-current-and-releases
+        current_path: "{{ _rollback_validation_root.path }}/application/releases/current"
+        active_target: "{{ _rollback_validation_root.path }}/application/releases/1.4.2"
+        releases_path: "{{ _rollback_validation_root.path }}/application/releases"
+        shared_path: "{{ _rollback_validation_root.path }}/application/shared"
+        target_version: "1.4.1"
+        healthcheck_enabled: false
+        expected_error: "release_base_dir must be"
+  tasks:
+    - name: Create isolated rollback validation workspace
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: release-ops-rollback-validation
+      register: _rollback_validation_root
+
+    - name: Exercise rollback input and state validation
+      block:
+        - name: Create retained release fixtures
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: directory
+            mode: "0755"
+          loop:
+            - "{{ _rollback_validation_root.path }}/application/releases/1.4.1"
+            - "{{ _rollback_validation_root.path }}/application/releases/1.4.2"
+            - "{{ _rollback_validation_root.path }}/application/shared"
+            - "{{ _rollback_validation_root.path }}/outside-release"
+
+        - name: Run validation cases
+          ansible.builtin.include_tasks: rollback_validation_case.yml
+          loop: "{{ _rollback_validation_cases }}"
+          loop_control:
+            label: "{{ item.name }}"
+
+      always:
+        - name: Remove isolated rollback validation workspace
+          ansible.builtin.file:
+            path: "{{ _rollback_validation_root.path }}"
+            state: absent

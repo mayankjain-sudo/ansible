@@ -1,0 +1,8 @@
+---
+galaxy_info:
+  role_name: rollback
+  author: Mayank Jain
+  description: Restore and verify a previously deployed application release.
+  license: MIT
+  min_ansible_version: "2.18"
+dependencies: []

@@ -1,0 +1,117 @@
+---
+- name: Verify rollback recovery after an unhealthy target
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars:
+    release_app_name: rollback-recovery-test
+    release_manage_service: false
+    release_run_as_user: root
+    release_run_as_group: root
+  tasks:
+    - name: Create an isolated rollback test workspace
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: release-ops-rollback-test
+      register: _rollback_test_root
+
+    - name: Exercise rollback recovery
+      block:
+        - name: Create fixture release directories
+          ansible.builtin.file:
+            path: "{{ _rollback_test_root.path }}/application/releases/{{ item }}"
+            state: directory
+            mode: "0755"
+          loop:
+            - "1.4.1"
+            - "1.4.2"
+
+        - name: Point the fixture at the healthy release
+          ansible.builtin.file:
+            src: "{{ _rollback_test_root.path }}/application/releases/1.4.2"
+            dest: "{{ _rollback_test_root.path }}/application/current"
+            state: link
+
+        - name: Select an available local test port
+          ansible.builtin.command:
+            argv:
+              - python3
+              - -c
+              - import socket; sock = socket.socket(); sock.bind(('127.0.0.1', 0)); print(sock.getsockname()[1]); sock.close()
+          register: _rollback_test_port
+          changed_when: false
+
+        - name: Start the fixture health endpoint
+          ansible.builtin.command:
+            argv:
+              - python3
+              - "{{ playbook_dir }}/health_server.py"
+              - "{{ _rollback_test_root.path }}/application/current"
+              - "{{ _rollback_test_port.stdout }}"
+              - "{{ _rollback_test_root.path }}/unhealthy-versions.txt"
+          async: 3600
+          poll: 0
+          register: _rollback_test_server
+
+        - name: Wait for the fixture health endpoint
+          ansible.builtin.wait_for:
+            host: 127.0.0.1
+            port: "{{ _rollback_test_port.stdout }}"
+            state: started
+            timeout: 10
+
+        - name: Configure requested rollback release as unhealthy
+          ansible.builtin.copy:
+            dest: "{{ _rollback_test_root.path }}/unhealthy-versions.txt"
+            content: "1.4.1"
+            mode: "0644"
+
+        - name: Attempt rollback and expect recovery from the unhealthy target
+          block:
+            - name: Run the rollback role
+              ansible.builtin.include_role:
+                name: mayankjain_sudo.release_ops.rollback
+              vars:
+                release_base_dir: "{{ _rollback_test_root.path }}/application"
+                release_rollback_target_version: "1.4.1"
+                release_healthcheck_url: "http://127.0.0.1:{{ _rollback_test_port.stdout }}/health"
+                release_healthcheck_retries: 1
+                release_healthcheck_delay: 0
+
+          rescue:
+            - name: Record the expected rollback task failure
+              ansible.builtin.set_fact:
+                _rollback_test_role_failed: true
+
+        - name: Inspect the final active release
+          ansible.builtin.stat:
+            path: "{{ _rollback_test_root.path }}/application/current"
+            follow: false
+          register: _rollback_test_final
+
+        - name: Verify recovery status and final active release
+          ansible.builtin.assert:
+            that:
+              - _rollback_test_role_failed | default(false)
+              - release_result.rollback_status == 'rollback_failed'
+              - release_result.outcome == 'rollback_failed'
+              - release_result.active_version == '1.4.2'
+              - release_result.healthcheck_status == 'healthy'
+              - release_result.rollback_error | length > 0
+              - release_result.recovery_error == ''
+              - _rollback_test_final.stat.islnk
+              - _rollback_test_final.stat.lnk_source == _rollback_test_root.path ~ '/application/releases/1.4.2'
+
+      always:
+        - name: Stop the fixture health endpoint
+          ansible.builtin.uri:
+            url: "http://127.0.0.1:{{ _rollback_test_port.stdout }}/shutdown"
+            status_code: 200
+            timeout: 2
+          when: _rollback_test_server is defined
+          failed_when: false
+
+        - name: Remove the rollback test workspace
+          ansible.builtin.file:
+            path: "{{ _rollback_test_root.path }}"
+            state: absent

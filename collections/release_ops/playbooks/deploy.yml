@@ -1,0 +1,16 @@
+---
+- name: Deploy application release
+  hosts: application_servers
+  become: true
+  serial: 1
+  roles:
+    - role: release
+      vars:
+        release_app_name: your-app
+        release_version: "{{ app_version }}"
+        release_base_dir: /opt/apps/your-app
+        release_artifact_path: "{{ artifact_path }}"
+        release_manage_service: true
+        release_service_name: your-app
+        release_healthcheck_url: http://127.0.0.1:8080/health
+        release_auto_rollback: true

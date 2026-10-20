@@ -1,0 +1,13 @@
+---
+galaxy_info:
+  role_name: preflight
+  author: Mayank Jain
+  description: Validate release inputs and target-host prerequisites.
+  license: MIT
+  min_ansible_version: "2.16"
+  platforms:
+    - name: EL
+      versions: ["8", "9"]
+    - name: Debian
+      versions: ["bullseye", "bookworm"]
+dependencies: []

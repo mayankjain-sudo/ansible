@@ -1,0 +1,41 @@
+---
+- name: Reset deployment failure case state
+  ansible.builtin.set_fact:
+    _deploy_failure_caught: false
+    _deploy_failure_message: ""
+
+- name: Attempt deployment with invalid inputs or staging artifact
+  block:
+    - name: Include release role and expect failure
+      ansible.builtin.include_role:
+        name: mayankjain_sudo.release_ops.release
+      vars:
+        release_app_name: failure-scenarios-test
+        release_version: "{{ item.version }}"
+        release_base_dir: "{{ _failure_test_root.path }}/application"
+        release_artifact_path: "{{ _failure_test_root.path }}/fixtures/{{ item.artifact }}"
+        release_artifact_sha256: "{{ item.checksum | default('') }}"
+        release_run_as_user: "{{ ansible_facts.user_id }}"
+        release_run_as_group: "{{ lookup('pipe', 'id -gn') }}"
+        release_manage_service: false
+        release_healthcheck_enabled: false
+
+  rescue:
+    - name: Capture expected deployment failure
+      ansible.builtin.set_fact:
+        _deploy_failure_caught: true
+        _deploy_failure_message: "{{ ansible_failed_result.msg | default('deployment failed') }}"
+
+- name: Inspect current pointer after rejected deployment
+  ansible.builtin.stat:
+    path: "{{ _failure_test_root.path }}/application/current"
+    follow: false
+  register: _deploy_failure_current
+
+- name: Confirm failure occurred before activation
+  ansible.builtin.assert:
+    that:
+      - _deploy_failure_caught
+      - _deploy_failure_message is search(item.expected_error)
+      - _deploy_failure_current.stat.islnk
+      - _deploy_failure_current.stat.lnk_source == _failure_test_root.path ~ '/application/releases/1.0.0'

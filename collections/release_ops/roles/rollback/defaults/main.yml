@@ -1,0 +1,13 @@
+---
+release_rollback_target_version: "" # noqa: var-naming[no-role-prefix]
+release_manage_service: false # noqa: var-naming[no-role-prefix]
+release_service_name: "" # noqa: var-naming[no-role-prefix]
+release_service_state: restarted # noqa: var-naming[no-role-prefix]
+release_run_as_user: root # noqa: var-naming[no-role-prefix]
+release_run_as_group: root # noqa: var-naming[no-role-prefix]
+release_healthcheck_enabled: true # noqa: var-naming[no-role-prefix]
+release_healthcheck_url: "" # noqa: var-naming[no-role-prefix]
+release_expected_status: 200 # noqa: var-naming[no-role-prefix]
+release_healthcheck_retries: 10 # noqa: var-naming[no-role-prefix]
+release_healthcheck_delay: 3 # noqa: var-naming[no-role-prefix]
+release_healthcheck_timeout: 5 # noqa: var-naming[no-role-prefix]

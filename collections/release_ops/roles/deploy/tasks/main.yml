@@ -1,0 +1,150 @@
+---
+- name: Validate deployment inputs and artifact
+  ansible.builtin.include_role:
+    name: mayankjain_sudo.release_ops.preflight
+
+- name: Create release directory layout
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ release_run_as_user }}"
+    group: "{{ release_run_as_group }}"
+    mode: "0755"
+  loop:
+    - "{{ release_base_dir }}"
+    - "{{ release_releases_dir | default(release_base_dir ~ '/releases') }}"
+    - "{{ release_shared_dir | default(release_base_dir ~ '/shared') }}"
+
+- name: Inspect the active release pointer
+  ansible.builtin.stat:
+    path: "{{ release_current_path | default(release_base_dir ~ '/current') }}"
+    follow: false
+  register: deploy_current_stat
+
+- name: Determine whether staging is required
+  ansible.builtin.set_fact:
+    deploy_final_path: "{{ release_releases_dir | default(release_base_dir ~ '/releases') }}/{{ release_version }}"
+    deploy_current_target: "{{ deploy_current_stat.stat.lnk_source | default('') }}"
+    deploy_stage_needed: >-
+      {{ deploy_current_stat.stat.lnk_source | default('') !=
+         (release_releases_dir | default(release_base_dir ~ '/releases')) ~ '/' ~ release_version }}
+
+- name: Inspect an existing version directory
+  ansible.builtin.stat:
+    path: "{{ deploy_final_path }}"
+  register: deploy_final_stat
+
+- name: Refuse to overwrite an existing inactive release
+  ansible.builtin.assert:
+    that:
+      - not deploy_final_stat.stat.exists or not deploy_stage_needed
+    fail_msg: >-
+      Release {{ release_version }} already exists but is not active. Refusing
+      to overwrite immutable release contents; use a new version or inspect it.
+
+- name: Create a unique staging directory
+  ansible.builtin.tempfile:
+    state: directory
+    path: "{{ release_releases_dir | default(release_base_dir ~ '/releases') }}"
+    prefix: ".{{ release_version }}.staging."
+  register: deploy_staging
+  when: deploy_stage_needed
+
+- name: Extract and publish the staged release
+  when: deploy_stage_needed
+  block:
+    - name: Copy archive inspection utility into staging
+      ansible.builtin.copy:
+        src: "{{ role_path }}/files/inspect_archive.py"
+        dest: "{{ deploy_staging.path }}/.inspect_archive.py"
+        owner: "{{ release_run_as_user }}"
+        group: "{{ release_run_as_group }}"
+        mode: "0700"
+
+    - name: Inspect archive paths and entry types before extraction
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_facts.python.executable | default('/usr/bin/python3') }}"
+          - "{{ deploy_staging.path }}/.inspect_archive.py"
+          - "{{ release_artifact_path }}"
+          - "{{ preflight_archive_format }}"
+      register: deploy_archive_inspection
+      changed_when: false
+      failed_when: false
+
+    - name: Reject unsafe, malformed, or unsupported archive entries
+      ansible.builtin.assert:
+        that:
+          - deploy_archive_inspection.rc == 0
+          - deploy_archive_inspection.stdout | int > 0
+        fail_msg: >-
+          Archive safety inspection failed:
+          {{ deploy_archive_inspection.stderr | default('invalid archive') }}
+
+    - name: Remove archive inspection utility from staging
+      ansible.builtin.file:
+        path: "{{ deploy_staging.path }}/.inspect_archive.py"
+        state: absent
+
+    - name: Extract the trusted release archive
+      ansible.builtin.unarchive:
+        src: "{{ release_artifact_path }}"
+        dest: "{{ deploy_staging.path }}"
+        remote_src: true
+        owner: "{{ release_run_as_user }}"
+        group: "{{ release_run_as_group }}"
+        mode: "u=rwX,g=rX,o=rX"
+
+    - name: Inspect staged files
+      ansible.builtin.find:
+        paths: "{{ deploy_staging.path }}"
+        recurse: true
+        file_type: file
+      register: deploy_staged_files
+
+    - name: Reject empty archives
+      ansible.builtin.assert:
+        that:
+          - deploy_staged_files.matched | int > 0
+        fail_msg: "The release archive extracted no regular files."
+
+    - name: Publish the complete release directory
+      ansible.builtin.command:
+        argv:
+          - mv
+          - --
+          - "{{ deploy_staging.path }}"
+          - "{{ deploy_final_path }}"
+      register: deploy_publish
+      changed_when: true
+
+  rescue:
+    - name: Remove incomplete staging directory
+      ansible.builtin.file:
+        path: "{{ deploy_staging.path }}"
+        state: absent
+
+    - name: Report staging failure
+      ansible.builtin.fail:
+        msg: >-
+          Staging release {{ release_version }} failed before activation:
+          {{ ansible_failed_result.msg | default('archive staging error') }}
+
+- name: Activate the staged release
+  ansible.builtin.file:
+    src: "{{ deploy_final_path }}"
+    dest: "{{ release_current_path | default(release_base_dir ~ '/current') }}"
+    state: link
+    force: true
+    owner: "{{ release_run_as_user }}"
+    group: "{{ release_run_as_group }}"
+  register: deploy_activation
+  notify: Release Ops manage service
+
+- name: Record that activation changed the active pointer
+  ansible.builtin.set_fact:
+    release_activation_occurred: "{{ deploy_activation.changed | bool }}"
+  # noqa: var-naming[no-role-prefix]
+
+- name: Apply service action after activation
+  ansible.builtin.meta: flush_handlers

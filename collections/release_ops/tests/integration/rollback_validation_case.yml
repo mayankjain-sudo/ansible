@@ -1,0 +1,50 @@
+---
+- name: Reset validation outcome
+  ansible.builtin.set_fact:
+    _rollback_validation_failed: false
+    _rollback_validation_error: ""
+
+- name: Set the active pointer for this validation case
+  ansible.builtin.file:
+    src: "{{ item.active_target }}"
+    dest: "{{ item.current_path }}"
+    state: link
+    force: true
+
+- name: Run rollback and expect validation to fail before activation
+  block:
+    - name: Include rollback role with case configuration
+      ansible.builtin.include_role:
+        name: mayankjain_sudo.release_ops.rollback
+      vars:
+        release_app_name: rollback-validation-test
+        release_base_dir: "{{ _rollback_validation_root.path }}/application"
+        release_releases_dir: "{{ item.releases_path }}"
+        release_current_path: "{{ item.current_path }}"
+        release_shared_dir: "{{ item.shared_path }}"
+        release_rollback_target_version: "{{ item.target_version }}"
+        release_manage_service: false
+        release_healthcheck_enabled: "{{ item.healthcheck_enabled }}"
+        release_healthcheck_url: "{{ item.healthcheck_url | default('') }}"
+        release_run_as_user: "{{ ansible_facts.user_id }}"
+        release_run_as_group: "{{ lookup('pipe', 'id -gn') }}"
+
+  rescue:
+    - name: Record expected validation failure
+      ansible.builtin.set_fact:
+        _rollback_validation_failed: true
+        _rollback_validation_error: "{{ ansible_failed_result.msg | default('validation failed') }}"
+
+- name: Inspect active pointer after validation
+  ansible.builtin.stat:
+    path: "{{ item.current_path }}"
+    follow: false
+  register: _rollback_validation_current
+
+- name: Verify validation failed and pointer was unchanged
+  ansible.builtin.assert:
+    that:
+      - _rollback_validation_failed
+      - _rollback_validation_error is search(item.expected_error)
+      - _rollback_validation_current.stat.islnk
+      - _rollback_validation_current.stat.lnk_source == item.active_target
