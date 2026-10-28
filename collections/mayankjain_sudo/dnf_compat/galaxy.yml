@@ -1,0 +1,17 @@
+---
+namespace: mayankjain_sudo
+name: dnf_compat
+version: 1.0.0
+readme: README.md
+authors:
+  - Mayank Jain
+description: Manage EL8 RPM packages through the DNF CLI without Python DNF bindings.
+license:
+  - MIT
+tags:
+  - linux
+  - dnf
+  - rhel
+dependencies: {}
+repository: https://github.com/mayankjain-sudo/ansible
+build_ignore: []

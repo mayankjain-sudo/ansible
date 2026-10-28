@@ -1,0 +1,11 @@
+---
+galaxy_info:
+  author: Mayank Jain
+  description: Manage EL8 packages through the DNF command-line client.
+  license: MIT
+  min_ansible_version: "2.17"
+  platforms:
+    - name: EL
+      versions:
+        - "8"
+dependencies: []

@@ -1,0 +1,85 @@
+---
+- name: Validate requested package state
+  ansible.builtin.assert:
+    that:
+      - dnf_compat_state in ['present', 'absent']
+    fail_msg: "dnf_compat_state must be either 'present' or 'absent'."
+
+- name: Validate package list
+  ansible.builtin.assert:
+    that:
+      - dnf_compat_packages is sequence
+      - dnf_compat_packages is not string
+      - dnf_compat_packages is not mapping
+      - dnf_compat_packages | length > 0
+      - dnf_compat_packages | select('string') | list | length == dnf_compat_packages | length
+      - >-
+        dnf_compat_packages
+        | select('match', '^[A-Za-z0-9][A-Za-z0-9._+:-]*$')
+        | list
+        | length == dnf_compat_packages | length
+    fail_msg: >-
+      dnf_compat_packages must be a non-empty list of RPM package names
+      containing only letters, digits, '.', '_', '+', ':', or '-'.
+
+- name: Find packages that need installation
+  ansible.builtin.raw: >-
+    for package in {{ dnf_compat_packages | map('quote') | join(' ') }};
+    do
+      if ! rpm -q --quiet -- "$package"; then
+        printf '%s\n' "$package";
+      fi;
+    done
+  register: packages_to_install
+  changed_when: false
+  check_mode: false
+  when: dnf_compat_state == 'present'
+
+- name: Find packages that need removal
+  ansible.builtin.raw: >-
+    for package in {{ dnf_compat_packages | map('quote') | join(' ') }};
+    do
+      if rpm -q --quiet -- "$package"; then
+        printf '%s\n' "$package";
+      fi;
+    done
+  register: packages_to_remove
+  changed_when: false
+  check_mode: false
+  when: dnf_compat_state == 'absent'
+
+- name: Install requested packages
+  ansible.builtin.raw: >-
+    dnf -y install {{ dnf_compat_packages | map('quote') | join(' ') }}
+  when:
+    - dnf_compat_state == 'present'
+    - packages_to_install.stdout | trim | length > 0
+    - not ansible_check_mode
+  changed_when: true
+
+- name: Remove requested packages
+  ansible.builtin.raw: >-
+    dnf -y remove {{ dnf_compat_packages | map('quote') | join(' ') }}
+  when:
+    - dnf_compat_state == 'absent'
+    - packages_to_remove.stdout | trim | length > 0
+    - not ansible_check_mode
+  changed_when: true
+
+- name: Report pending package installation in check mode
+  ansible.builtin.debug:
+    msg: "Would install: {{ packages_to_install.stdout_lines | join(', ') }}"
+  when:
+    - ansible_check_mode
+    - dnf_compat_state == 'present'
+    - packages_to_install.stdout | trim | length > 0
+  changed_when: true
+
+- name: Report pending package removal in check mode
+  ansible.builtin.debug:
+    msg: "Would remove: {{ packages_to_remove.stdout_lines | join(', ') }}"
+  when:
+    - ansible_check_mode
+    - dnf_compat_state == 'absent'
+    - packages_to_remove.stdout | trim | length > 0
+  changed_when: true
